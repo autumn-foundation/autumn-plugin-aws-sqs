@@ -77,8 +77,12 @@ fn is_plain_http_remote(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://") else {
         return false;
     };
-    let host = rest.split(['/', ':']).next().unwrap_or_default();
-    !matches!(host, "localhost" | "127.0.0.1" | "[") && !host.starts_with("127.")
+    let authority = rest.split('/').next().unwrap_or_default();
+    if let Some(v6) = authority.strip_prefix('[') {
+        return !v6.starts_with("::1]");
+    }
+    let host = authority.split(':').next().unwrap_or_default();
+    host != "localhost" && !host.starts_with("127.")
 }
 
 /// Maps an SQS error code to [`SqsError`].
@@ -471,5 +475,7 @@ mod tests {
         assert!(!is_plain_http_remote("http://localhost:4566"));
         assert!(!is_plain_http_remote("http://127.0.0.1:4566"));
         assert!(!is_plain_http_remote("https://sqs.us-east-1.amazonaws.com"));
+        assert!(!is_plain_http_remote("http://[::1]:4566/q"));
+        assert!(is_plain_http_remote("http://[2001:db8::1]/q"));
     }
 }

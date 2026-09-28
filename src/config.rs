@@ -2,9 +2,10 @@
 //!
 //! Sources, in order (later wins):
 //! 1. `[aws_sqs]` in `autumn.toml`.
-//! 2. `[aws_sqs]` in the profile file, for example `autumn-prod.toml`.
-//! 3. Environment variables `AUTUMN_AWS_SQS__<PATH>`, for example
-//!    `AUTUMN_AWS_SQS__QUEUES__DEFAULT=https://...`.
+//! 2. `[profile.<name>.aws_sqs]` in `autumn.toml`.
+//! 3. `[aws_sqs]` in the profile file, for example `autumn-prod.toml`.
+//! 4. `.env` values, then the process environment: `AUTUMN_AWS_SQS__<PATH>`,
+//!    for example `AUTUMN_AWS_SQS__QUEUES__DEFAULT=https://...`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -202,7 +203,8 @@ impl SqsConfig {
                 break;
             }
         }
-        Self::from_layers(base.as_deref(), profile_names, profile.as_deref(), env)
+        let inline = inline_profile_order(profile_names);
+        Self::from_layers(base.as_deref(), &inline, profile.as_deref(), env)
     }
 
     /// Loads config like autumn-web does.
@@ -220,9 +222,11 @@ impl SqsConfig {
         let os = autumn_web::config::OsEnv;
         let names = profile
             .map(|p| {
+                // Same selector order as autumn-web: env vars, then `--profile`.
                 let selector = ["AUTUMN_ENV", "AUTUMN_PROFILE"]
                     .iter()
                     .find_map(|k| os.var(k).ok().filter(|v| !v.trim().is_empty()))
+                    .or_else(profile_flag)
                     .map_or_else(|| p.to_owned(), |v| v.trim().to_owned());
                 autumn_web::config::profile_override_file_lookup_names(p, &selector)
             })
@@ -230,7 +234,7 @@ impl SqsConfig {
         let dir = os
             .var("AUTUMN_MANIFEST_DIR")
             .map_or_else(|_| PathBuf::from("."), PathBuf::from);
-        Self::load_from_dir(&dir, &names, process_env())
+        Self::load_from_dir(&dir, &names, process_env()?)
     }
 
     /// Checks the values.
@@ -348,13 +352,41 @@ impl SqsConfig {
 }
 
 /// Returns `.env` values, then the process environment (later wins).
-pub(crate) fn process_env() -> Vec<(String, String)> {
-    let mut vars = autumn_web::dotenv::resolve_process_dotenv().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "aws_sqs: .env is not valid; it is not used");
-        Vec::new()
+///
+/// It skips a variable whose name or value is not UTF-8.
+pub(crate) fn process_env() -> Result<Vec<(String, String)>, SqsError> {
+    let mut vars = autumn_web::dotenv::resolve_process_dotenv()
+        .map_err(|e| SqsError::Config(format!(".env: {e}")))?;
+    vars.extend(
+        std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+    );
+    Ok(vars)
+}
+
+/// The value of `--profile <name>` or `--profile=<name>` in the process args.
+fn profile_flag() -> Option<String> {
+    let args: Vec<String> = std::env::args_os()
+        .filter_map(|a| a.into_string().ok())
+        .collect();
+    args.iter().enumerate().find_map(|(i, a)| {
+        a.strip_prefix("--profile=").map(str::to_owned).or_else(|| {
+            (a == "--profile")
+                .then(|| args.get(i + 1).cloned())
+                .flatten()
+        })
+    })
+}
+
+/// Inline `[profile.<name>]` merge order of autumn-web: the long alias first,
+/// so the short name wins.
+fn inline_profile_order(profile_names: &[String]) -> Vec<String> {
+    let mut names = profile_names.to_vec();
+    names.sort_by_key(|n| match n.as_str() {
+        "production" | "development" => 0,
+        _ => 1,
     });
-    vars.extend(std::env::vars());
-    vars
+    names
 }
 
 /// Reads one variable from the process environment, else from `.env`.
@@ -657,6 +689,23 @@ mod tests {
         assert_eq!(cfg.region.as_deref(), Some("eu-west-1"));
         let dev = SqsConfig::from_layers(Some(&base), &["dev".to_owned()], None, env(&[])).unwrap();
         assert_eq!(dev.region.as_deref(), Some("us-east-1"));
+    }
+
+    #[test]
+    fn inline_order_lets_short_name_win() {
+        let names = vec!["prod".to_owned(), "production".to_owned()];
+        assert_eq!(inline_profile_order(&names), vec!["production", "prod"]);
+        let base = format!(
+            "[aws_sqs.queues]\ndefault = \"{URL}\"\n\
+             [profile.production.aws_sqs]\nregion = \"long\"\n\
+             [profile.prod.aws_sqs]\nregion = \"short\"\n"
+        );
+        let dir = std::env::temp_dir().join(format!("aws-sqs-inline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("autumn.toml"), base).unwrap();
+        let cfg = SqsConfig::load_from_dir(&dir, &names, env(&[])).unwrap();
+        assert_eq!(cfg.region.as_deref(), Some("short"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

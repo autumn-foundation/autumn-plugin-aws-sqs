@@ -124,9 +124,16 @@ pub(crate) async fn run(ctx: WorkerCtx, spec: WorkerSpec) {
             }
             continue;
         }
-        let max_messages = u32::try_from(free)
-            .unwrap_or(u32::MAX)
-            .min(ctx.config.max_messages);
+        // FIFO: one message per receive. SQS then locks its group until it
+        // settles. A batch would hold later messages of the group, and each
+        // receive would use up their attempts before they run.
+        let max_messages = if fifo {
+            1
+        } else {
+            u32::try_from(free)
+                .unwrap_or(u32::MAX)
+                .min(ctx.config.max_messages)
+        };
         let options = ReceiveOptions {
             max_messages,
             wait_secs: ctx.config.wait_time_secs,
@@ -154,7 +161,14 @@ pub(crate) async fn run(ctx: WorkerCtx, spec: WorkerSpec) {
                     });
                     let (ctx, spec) = (ctx.clone(), spec.clone());
                     tasks.spawn(async move {
-                        handle_unit(&ctx, &spec, unit, received_at).await;
+                        // Keeps `in_flight` right when a drain timeout aborts the task.
+                        let guard = InFlight {
+                            metrics: Arc::clone(&ctx.metrics),
+                            label: spec.label.clone(),
+                            left: std::sync::atomic::AtomicU64::new(n),
+                        };
+                        handle_unit(&ctx, &spec, unit, received_at, &guard).await;
+                        drop(guard);
                         drop(permit);
                     });
                 }
@@ -192,6 +206,35 @@ async fn drain(ctx: &WorkerCtx, spec: &WorkerSpec, mut tasks: JoinSet<()>) {
     }
 }
 
+/// Decrements `in_flight` for messages not yet settled when dropped.
+struct InFlight {
+    metrics: Arc<SqsMetrics>,
+    label: String,
+    left: std::sync::atomic::AtomicU64,
+}
+
+impl InFlight {
+    /// One message of the unit is settled.
+    fn settle(&self) {
+        if self.left.load(Ordering::SeqCst) > 0 {
+            self.left.fetch_sub(1, Ordering::SeqCst);
+            self.metrics
+                .update(&self.label, |c| c.in_flight = c.in_flight.saturating_sub(1));
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let left = self.left.load(Ordering::SeqCst);
+        if left > 0 {
+            self.metrics.update(&self.label, |c| {
+                c.in_flight = c.in_flight.saturating_sub(left);
+            });
+        }
+    }
+}
+
 /// Receipts that the heartbeat keeps invisible.
 type Pending = Arc<Mutex<Vec<String>>>;
 
@@ -210,6 +253,7 @@ async fn handle_unit(
     spec: &WorkerSpec,
     unit: Vec<ReceivedMessage>,
     received_at: Instant,
+    in_flight: &InFlight,
 ) {
     let pending: Pending = Arc::new(Mutex::new(
         unit.iter().map(|m| m.receipt_handle.clone()).collect(),
@@ -218,14 +262,12 @@ async fn handle_unit(
         let mut rest = unit.into_iter();
         while let Some(message) = rest.next() {
             let stays = handle(ctx, spec, &message, received_at, &pending).await;
-            ctx.metrics
-                .update(&spec.label, |c| c.in_flight = c.in_flight.saturating_sub(1));
+            in_flight.settle();
             if let Some(wait) = stays {
                 for later in rest.by_ref() {
                     forget(&pending, &later.receipt_handle);
                     set_visibility(ctx, spec, &later.receipt_handle, wait, received_at).await;
-                    ctx.metrics
-                        .update(&spec.label, |c| c.in_flight = c.in_flight.saturating_sub(1));
+                    in_flight.settle();
                 }
             }
         }

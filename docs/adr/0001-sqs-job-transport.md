@@ -95,5 +95,21 @@ Proposed change, either one:
 - Accept `backend = "external"`: a plugin owns the jobs, and autumn starts none.
 
 Until then, the README tells users to set `backend = "redis"` with no autumn
-jobs. We checked this with the example app: a `web` process and a `worker`
-process ran against LocalStack.
+jobs and no durable event listeners.
+
+Test: the example app runs a `web` process and a `worker` process against
+LocalStack with these env vars:
+
+```bash
+AUTUMN_JOBS__BACKEND=redis
+AUTUMN_AWS_SQS__REGION=us-east-1
+AUTUMN_AWS_SQS__ENDPOINT=http://localhost:4566
+AUTUMN_AWS_SQS__QUEUES__DEFAULT=http://localhost:4566/000000000000/role-jobs
+AUTUMN_AWS_SQS__QUEUES__UPLOADS=http://localhost:4566/000000000000/role-uploads
+AUTUMN_AWS_SQS__QUEUES__EVENTS=http://localhost:4566/000000000000/role-events
+AUTUMN_AWS_SQS__QUEUES__DLQ=http://localhost:4566/000000000000/role-dlq
+AUTUMN_AWS_SQS__JOBS__DEAD_LETTER_QUEUE=dlq
+AUTUMN_ROLE=web      # second process: AUTUMN_ROLE=worker
+```
+
+The web process sends the job. The worker process runs it.

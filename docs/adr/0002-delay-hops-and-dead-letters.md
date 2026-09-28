@@ -27,10 +27,12 @@
    With no redrive policy either, a warning shows at startup.
 4. **Poison.** A panic, bad JSON, an unknown job, a job from another queue, or
    `ConsumerError::Reject` goes to the dead-letter path at once.
-5. **12 h limit.** Each visibility change is clamped to the time left from the
-   receive, minus 5 s. The heartbeat stops when no time is left.
-6. **FIFO order.** The worker runs one group in sequence. When a message stays,
-   the rest of its group waits the same time.
+5. **12 h limit.** The worker clamps each visibility change to the time left
+   from the receive, minus 5 s. The heartbeat stops when no time is left.
+6. **FIFO order.** The worker receives one message at a time from a FIFO
+   queue. SQS locks the group until that message settles. A batch receive
+   holds later messages of the group. Each receive then adds to their receive
+   count, so they can use up their attempts before they run (review round 2).
 
 ## Reasons
 

@@ -45,7 +45,7 @@ AUTUMN_AWS_SQS__QUEUES__DEFAULT=https://sqs.../app-jobs
 AUTUMN_AWS_SQS__WORKER__MAX_IN_FLIGHT=32
 ```
 
-`AwsSqsPlugin::with_config(config)` uses the config you give. It reads no files and no env vars.
+`AwsSqsPlugin::with_config(config)` uses the config you give. It reads no config files and no `AUTUMN_AWS_SQS__*` env vars. Credentials still come from the env vars that the config names, or from the AWS chain.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -86,7 +86,7 @@ jobs.enqueue_in(SendWelcomeEmailJob::NAME, &args, Duration::from_secs(3600)).awa
 jobs.enqueue_at(SendWelcomeEmailJob::NAME, &args, when).await?;
 ```
 
-Do not register these jobs with `AppBuilder::jobs`. Then `XJob::enqueue` returns an error. This stops a job from going to the local queue by mistake.
+Do not register these jobs with `AppBuilder::jobs`. If you do not register them, `XJob::enqueue` returns an error. Thus a job cannot go to the local queue by mistake.
 
 | `#[job]` attribute | Over SQS |
 |---|---|
@@ -94,12 +94,12 @@ Do not register these jobs with `AppBuilder::jobs`. Then `XJob::enqueue` returns
 | `queue` | Alias in `[aws_sqs.queues]`. With no alias, the job uses the default queue. A warning shows at startup. |
 | `max_attempts`, `backoff_ms` | The plugin uses these values. A value of 0 uses `[jobs]` in `autumn.toml` (5 and 250 ms). The backoff is `backoff_ms * 2^(attempt-1)`, rounded up to whole seconds, and `worker.max_backoff_secs` or less. |
 | `version`, `upgrade` | The plugin uses the autumn-web payload envelope. |
-| `unique`, `concurrency` | Not supported. A warning shows at startup. Use a FIFO `dedup_id` for dedup. |
-| `enqueue_tracked` | Not supported. |
+| `unique`, `concurrency` | The plugin does not apply them. A warning shows at startup. Use a FIFO `dedup_id` for dedup. |
+| `enqueue_tracked` | The plugin does not apply it. |
 
 The app `JobInterceptor` (`AppBuilder::with_job_interceptor`) wraps each SQS enqueue and each run. Each run has a `job.execute` tracing span.
 
-A job runs only from its own queue. A message that names a job of another queue goes to the dead-letter path.
+A job runs only from its own queue. A message that names a job of another queue goes to the dead-letter path. Before you move a job to another queue, drain the old queue.
 
 **Delays.** A delay of 900 s or less uses `DelaySeconds`. For a longer delay, the envelope stores `not_before`. The worker sends the message again every 15 minutes. It stops when the job is due. A hop does not use an attempt. The longest delay is 366 days. FIFO queues do not accept a delay.
 
@@ -122,12 +122,12 @@ flowchart TD
 ```
 
 - Delivery is at least once. Make handlers idempotent.
-- A dead letter has three attributes: `autumn-dead-letter-reason`, `autumn-source-queue`, and `autumn-attempts`. It keeps up to seven original attributes, so it stays in the SQS limit of 10.
-- The reason is 256 characters or less. JSON errors in it have no input values.
+- A dead letter has three attributes: `autumn-dead-letter-reason`, `autumn-source-queue`, and `autumn-attempts`. It keeps up to seven original attributes, so it stays in the SQS limit of 10. A message that is too large for these attributes goes without them.
+- The reason is 256 characters or less. It has no JSON input values. Bad `#[job]` args give the reason `job args deserialization failed`, with no retry.
 - Without `jobs.dead_letter_queue`, set a redrive policy with `maxReceiveCount` equal to `max_attempts` or more.
 - Visibility changes stay in the 12 h limit of one receive. A handler that runs longer loses its heartbeat, and the message can run again.
 
-**FIFO queues.** The worker runs the messages of one group in sequence. When a message stays for a retry, the rest of its group waits the same time. So the group keeps its order.
+**FIFO queues.** The worker receives one message at a time from a FIFO queue. SQS locks the group of that message until the worker deletes it or it becomes visible again. So each group keeps its order, and a retry does not use the attempts of later messages. Different groups run at the same time, up to `worker.max_in_flight`. A FIFO worker makes one receive call per message.
 
 ## Consumers
 
@@ -163,9 +163,9 @@ let results = producer.send_batch("events", messages).await?; // one result per 
 
 - Workers start only when `state.role().runs_workers()` is true (`combined` or `worker`).
 - A `web` replica sends jobs and runs no workers.
-- When the app drains (`/ready` is 503), the workers stop receiving messages. They wait up to `worker.drain_timeout_secs` for handlers that run.
+- When the app drains (`/ready` is 503), the workers stop the receive calls. They wait up to `worker.drain_timeout_secs` for handlers that run.
 
-**Split roles need a `[jobs]` backend value.** autumn-web 0.7 stops a `web` or `worker` process at boot when `[jobs] backend` is `local`. It does this even when the app has no autumn jobs. Set a durable backend name and register no jobs with `AppBuilder::jobs`. autumn then starts no job backend.
+**Split roles need a `[jobs]` backend value.** autumn-web 0.7 stops a `web` or `worker` process at boot when `[jobs] backend` is `local`. It does this even when the app has no autumn jobs. Set a durable backend name. Register no jobs with `AppBuilder::jobs` and no durable event listeners. autumn then starts no job backend.
 
 ```toml
 [jobs]
@@ -175,7 +175,7 @@ backend = "redis"   # autumn starts no backend: this app has no autumn jobs
 ## Operations
 
 - **Health.** The `aws_sqs` indicator on `/actuator/health` shows the message counts for each queue. An error shows as a class: `not_found`, `access_denied`, `timeout`, or `error`. Call `.readiness(true)` on the plugin to add it to `/ready`.
-- **Metrics** on `/actuator/prometheus`, label `queue` (an alias, or `unconfigured` for a raw URL):
+- **Metrics** on `/actuator/prometheus`. The label `queue` is the queue alias, the consumer name, or `unconfigured` for a raw URL:
   - `aws_sqs_messages_received_total`, `aws_sqs_messages_succeeded_total`, `aws_sqs_messages_retried_total`
   - `aws_sqs_messages_dead_lettered_total`, `aws_sqs_messages_poisoned_total`, `aws_sqs_messages_redrive_deferred_total`
   - `aws_sqs_messages_sent_total`, `aws_sqs_send_errors_total`, `aws_sqs_receive_errors_total`, `aws_sqs_ack_errors_total`
@@ -196,7 +196,7 @@ let rt = AwsSqsPlugin::with_config(config)
 rt.shutdown().await;
 ```
 
-- `MemoryTransport` follows the SQS rules this crate uses: visibility, receive count, delay, long poll, FIFO groups and dedup, redrive, the 12 h limit, and the size and attribute limits.
+- `MemoryTransport` follows the SQS rules that this crate uses. These rules are: visibility, receive count, delay, long poll, FIFO groups and dedup, redrive, and the 12 h limit. It also has the size and attribute limits.
 - It uses `tokio::time`, so `#[tokio::test(start_paused = true)]` works.
 - With `autumn_web::test::TestApp`, give the plugin a `MemoryTransport`. `TestApp` does not run shutdown hooks, so the workers do not drain.
 

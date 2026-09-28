@@ -1,7 +1,8 @@
 //! Example app: a `#[job]` on SQS, a consumer, and a producer.
 //!
-//! Run `LocalStack`, then:
-//! `AUTUMN_AWS_SQS__ENDPOINT=http://localhost:4566 cargo run --example app`
+//! Run `LocalStack`, make the queues, and set the env vars in
+//! `docs/adr/0001-sqs-job-transport.md` ("Test"). Then:
+//! `cargo run --example app`
 #![allow(missing_docs)] // `#[job]` makes items with no docs.
 
 use autumn_plugin_aws_sqs::{

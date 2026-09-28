@@ -22,6 +22,9 @@ use crate::producer::SqsProducer;
 use crate::transport::{BoxFuture, OutboundMessage, ReceivedMessage, is_fifo};
 use crate::worker::{Dispatch, Outcome, RetryRule};
 
+/// Prefix of the `#[job]` macro error for args that do not decode.
+const ARGS_DECODE_ERROR: &str = "job args deserialization failed";
+
 /// Longest job delay: 366 days. A longer `not_before` is poison.
 pub const MAX_JOB_DELAY_SECS: u64 = 366 * 24 * 60 * 60;
 
@@ -369,6 +372,11 @@ impl Dispatch for JobDispatcher {
                 .await;
             match result {
                 Ok(()) => Outcome::Ack,
+                // The `#[job]` macro puts the serde text (with input values) in
+                // this error. Bad args do not get better on retry.
+                Err(e) if e.to_string().contains(ARGS_DECODE_ERROR) => {
+                    Outcome::Poison(ARGS_DECODE_ERROR.to_owned())
+                }
                 Err(e) => Outcome::Retry {
                     error: e.to_string(),
                     rule: route.rule,

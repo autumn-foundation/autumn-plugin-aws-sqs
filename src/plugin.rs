@@ -27,6 +27,9 @@ use crate::worker::{self, RetryRule, WorkerCtx, WorkerSpec};
 /// Plugin name for duplicate detection.
 pub const PLUGIN_NAME: &str = "autumn-plugin-aws-sqs";
 
+/// Time limit for each queue check at startup. Startup does not wait longer.
+const STARTUP_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How often the probe watcher reads the drain flag.
 const PROBE_POLL: Duration = Duration::from_millis(250);
 
@@ -288,7 +291,14 @@ impl AwsSqsPlugin {
         let mut watched: BTreeMap<String, String> = config.queues.clone();
         for spec in &specs {
             if !watched.values().any(|u| u == &spec.queue_url) {
-                watched.insert(spec.label.clone(), spec.queue_url.clone());
+                // Keys must be unique: two raw URLs share the label "unconfigured".
+                let mut key = spec.label.clone();
+                let mut n = 2;
+                while watched.contains_key(&key) {
+                    key = format!("{}-{n}", spec.label);
+                    n += 1;
+                }
+                watched.insert(key, spec.queue_url.clone());
             }
         }
 
@@ -399,8 +409,16 @@ fn job_route(
 /// Warns for each worker queue that has no SQS redrive policy. With no DLQ
 /// either, a failed message stays in the queue until its retention ends.
 async fn warn_without_dead_letter_path(transport: &dyn SqsTransport, specs: &[WorkerSpec]) {
-    for spec in specs {
-        if let Ok(stats) = transport.queue_stats(&spec.queue_url).await
+    let checks = specs.iter().map(|spec| async move {
+        let stats = tokio::time::timeout(
+            STARTUP_CHECK_TIMEOUT,
+            transport.queue_stats(&spec.queue_url),
+        )
+        .await;
+        (spec, stats)
+    });
+    for (spec, stats) in futures::future::join_all(checks).await {
+        if let Ok(Ok(stats)) = stats
             && stats.redrive_target.is_none()
         {
             tracing::warn!(

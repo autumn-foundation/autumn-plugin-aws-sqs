@@ -273,9 +273,19 @@ impl MemoryTransport {
             receipts.push(state.next());
         }
         let queue = state.queue(queue_url)?;
-        // FIFO: a group with a message that is not visible gives nothing after
-        // that message. Several visible messages of one group come in order.
-        let mut blocked: Vec<String> = Vec::new();
+        // FIFO: like SQS, a group with a message in flight gives nothing. A
+        // group with a delayed message gives nothing after that message.
+        // Several visible messages of one group come in order.
+        let mut blocked: Vec<String> = if fifo {
+            queue
+                .messages
+                .iter()
+                .filter(|m| m.in_flight(now))
+                .filter_map(|m| m.group_id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut out = Vec::new();
         let mut next_wake: Option<Instant> = None;
         let mut receipts = receipts.into_iter();

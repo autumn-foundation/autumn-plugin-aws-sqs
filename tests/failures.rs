@@ -551,3 +551,108 @@ async fn app_job_interceptor_wraps_enqueue_and_execute() {
     );
     rt.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn fifo_held_messages_keep_their_attempts() {
+    static SEEN: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+    static M2_FAILED: AtomicU32 = AtomicU32::new(0);
+    let t = memory();
+    let consumer = SqsConsumer::new(
+        "fifo_budget",
+        EVENTS_FIFO,
+        |_s: AppState, m: SqsMessage| async move {
+            SEEN.lock().unwrap().push((m.body.clone(), m.attempt));
+            if m.body == "1" {
+                return Err(ConsumerError::retry("head always fails"));
+            }
+            if m.body == "2" && M2_FAILED.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(ConsumerError::retry("once"));
+            }
+            Ok(())
+        },
+    )
+    .max_attempts(3)
+    .backoff_ms(1_000);
+    let (_state, rt) = start_with(t.clone(), config(), |p| p.consumer(consumer)).await;
+    for n in 1..=2 {
+        t.send(
+            EVENTS_FIFO,
+            OutboundMessage::new(n.to_string())
+                .group_id("g")
+                .dedup_id(n.to_string()),
+        )
+        .await
+        .unwrap();
+    }
+    wait_until(Duration::from_secs(120), || {
+        SEEN.lock()
+            .unwrap()
+            .iter()
+            .filter(|(b, _)| b == "2")
+            .count()
+            == 2
+    })
+    .await;
+    let seen = SEEN.lock().unwrap().clone();
+    let m2: Vec<u32> = seen
+        .iter()
+        .filter(|(b, _)| b == "2")
+        .map(|(_, a)| *a)
+        .collect();
+    // m2 starts at attempt 1 although the head failed three times first.
+    assert_eq!(m2, vec![1, 2], "{seen:?}");
+    rt.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn fifo_without_heartbeat_runs_each_message_once() {
+    static RUNS: AtomicU32 = AtomicU32::new(0);
+    let t = memory();
+    let mut cfg = config();
+    cfg.worker.heartbeat = false;
+    let consumer = SqsConsumer::new(
+        "fifo_nohb",
+        EVENTS_FIFO,
+        |_s: AppState, _m: SqsMessage| async {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            Ok(())
+        },
+    );
+    let (_state, rt) = start_with(t.clone(), cfg, |p| p.consumer(consumer)).await;
+    for n in 1..=4 {
+        t.send(
+            EVENTS_FIFO,
+            OutboundMessage::new(n.to_string())
+                .group_id("g")
+                .dedup_id(n.to_string()),
+        )
+        .await
+        .unwrap();
+    }
+    wait_until(Duration::from_secs(120), || {
+        t.messages(EVENTS_FIFO).is_empty()
+    })
+    .await;
+    assert_eq!(RUNS.load(Ordering::SeqCst), 4);
+    rt.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn bad_job_args_are_poison_without_values() {
+    let t = memory();
+    let (_state, rt) = start_with(t.clone(), config(), |p| p.jobs(jobs![h_default])).await;
+    t.send(
+        JOBS,
+        OutboundMessage::new(
+            r#"{"v":1,"job":"h_default","payload":{"n":"pii@example.com"},"enqueued_at":0}"#,
+        ),
+    )
+    .await
+    .unwrap();
+    wait_until(Duration::from_secs(10), || t.messages(DLQ).len() == 1).await;
+    let reason = &t.messages(DLQ)[0].attributes["autumn-dead-letter-reason"];
+    assert_eq!(reason, "job args deserialization failed");
+    assert_eq!(t.messages(DLQ)[0].attributes["autumn-attempts"], "1");
+    rt.shutdown().await;
+}
