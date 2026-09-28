@@ -24,6 +24,10 @@ use crate::worker::{Dispatch, Outcome, RetryRule};
 
 /// Prefix of the `#[job]` macro error for args that do not decode.
 const ARGS_DECODE_ERROR: &str = "job args deserialization failed";
+/// Text in every autumn-web payload version error.
+const PAYLOAD_VERSION_TEXT: &str = "stored payload version";
+/// Text of the autumn-web error for a payload from a newer version.
+const NEWER_VERSION_TEXT: &str = "is newer than expected";
 
 /// Longest job delay: 366 days. A longer `not_before` is poison.
 pub const MAX_JOB_DELAY_SECS: u64 = 366 * 24 * 60 * 60;
@@ -372,17 +376,35 @@ impl Dispatch for JobDispatcher {
                 .await;
             match result {
                 Ok(()) => Outcome::Ack,
-                // The `#[job]` macro puts the serde text (with input values) in
-                // this error. Bad args do not get better on retry.
-                Err(e) if e.to_string().contains(ARGS_DECODE_ERROR) => {
-                    Outcome::Poison(ARGS_DECODE_ERROR.to_owned())
-                }
-                Err(e) => Outcome::Retry {
-                    error: e.to_string(),
-                    rule: route.rule,
-                },
+                Err(e) => classify_handler_error(&e.to_string(), route.rule),
             }
         })
+    }
+}
+
+/// Maps a handler error to an outcome.
+///
+/// Args that do not decode are poison: they do not get better on retry. The
+/// `#[job]` macro puts the serde text, with input values, in these errors, so
+/// the reason keeps only the text before it. A payload from a newer version
+/// retries: a newer worker in a rolling deploy can run it.
+fn classify_handler_error(message: &str, rule: RetryRule) -> Outcome {
+    if message.contains(ARGS_DECODE_ERROR) {
+        return Outcome::Poison(ARGS_DECODE_ERROR.to_owned());
+    }
+    if autumn_web::payload_version::is_payload_version_error(message)
+        && !message.contains(NEWER_VERSION_TEXT)
+    {
+        // Text: `job "x": stored payload version N ...: <serde source>`.
+        let head = message
+            .find(PAYLOAD_VERSION_TEXT)
+            .and_then(|at| message[at..].find(": ").map(|end| &message[..at + end]))
+            .unwrap_or(message);
+        return Outcome::Poison(head.to_owned());
+    }
+    Outcome::Retry {
+        error: message.to_owned(),
+        rule,
     }
 }
 
@@ -457,5 +479,36 @@ mod tests {
         assert_eq!(o.delay, Some(Duration::from_secs(1)));
         assert_eq!(o.group_id.as_deref(), Some("g"));
         assert_eq!(o.dedup_id.as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn handler_errors_classify() {
+        let rule = RetryRule {
+            max_attempts: 3,
+            initial_backoff_ms: 10,
+        };
+        assert_eq!(
+            classify_handler_error("job args deserialization failed: invalid type: \"x\"", rule),
+            Outcome::Poison(ARGS_DECODE_ERROR.to_owned())
+        );
+        let shape = "job \"j\": stored payload version 2 does not match the current args shape: \
+                     invalid type: string \"secret\"";
+        assert_eq!(
+            classify_handler_error(shape, rule),
+            Outcome::Poison(
+                "job \"j\": stored payload version 2 does not match the current args shape"
+                    .to_owned()
+            )
+        );
+        let newer = "job \"j\": stored payload version 3 is newer than expected version 2; \
+                     this worker cannot decode it";
+        assert!(matches!(
+            classify_handler_error(newer, rule),
+            Outcome::Retry { .. }
+        ));
+        assert!(matches!(
+            classify_handler_error("db down", rule),
+            Outcome::Retry { .. }
+        ));
     }
 }

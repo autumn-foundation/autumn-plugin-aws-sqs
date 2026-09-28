@@ -369,13 +369,17 @@ fn profile_flag() -> Option<String> {
     let args: Vec<String> = std::env::args_os()
         .filter_map(|a| a.into_string().ok())
         .collect();
-    args.iter().enumerate().find_map(|(i, a)| {
-        a.strip_prefix("--profile=").map(str::to_owned).or_else(|| {
-            (a == "--profile")
-                .then(|| args.get(i + 1).cloned())
-                .flatten()
+    args.iter()
+        .enumerate()
+        .find_map(|(i, a)| {
+            a.strip_prefix("--profile=").map(str::to_owned).or_else(|| {
+                (a == "--profile")
+                    .then(|| args.get(i + 1).cloned())
+                    .flatten()
+            })
         })
-    })
+        // Like autumn-web: an empty value selects nothing.
+        .filter(|p| !p.trim().is_empty())
 }
 
 /// Inline `[profile.<name>]` merge order of autumn-web: the long alias first,

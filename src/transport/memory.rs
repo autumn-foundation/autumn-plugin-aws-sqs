@@ -293,6 +293,10 @@ impl MemoryTransport {
             if out.len() >= options.max_messages as usize {
                 break;
             }
+            if m.visible_at > now {
+                // Wake when this message becomes visible, also in a locked group.
+                next_wake = Some(next_wake.map_or(m.visible_at, |w| w.min(m.visible_at)));
+            }
             let group = m.group_id.clone().filter(|_| fifo);
             if let Some(g) = &group
                 && blocked.contains(g)
@@ -300,7 +304,6 @@ impl MemoryTransport {
                 continue;
             }
             if m.visible_at > now {
-                next_wake = Some(next_wake.map_or(m.visible_at, |w| w.min(m.visible_at)));
                 if let Some(g) = group {
                     blocked.push(g);
                 }

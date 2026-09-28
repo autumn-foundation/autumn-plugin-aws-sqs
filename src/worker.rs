@@ -32,6 +32,8 @@ pub(crate) const MIN_DEFER_SECS: u64 = 30;
 /// First wait after a receive error. Doubles to [`MAX_ERROR_BACKOFF`].
 const ERROR_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_ERROR_BACKOFF: Duration = Duration::from_secs(30);
+/// Pause after an empty receive when `wait_time_secs` is 0.
+const EMPTY_POLL_PAUSE: Duration = Duration::from_secs(1);
 
 /// Retry rule for a failed message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +149,15 @@ pub(crate) async fn run(ctx: WorkerCtx, spec: WorkerSpec) {
         match received {
             Ok(messages) => {
                 error_backoff = ERROR_BACKOFF;
+                // With no long poll, an empty receive returns at once. Pause so
+                // the loop does not spin.
+                if messages.is_empty() && ctx.config.wait_time_secs == 0 {
+                    tokio::select! {
+                        () = ctx.cancel.cancelled() => break,
+                        () = tokio::time::sleep(EMPTY_POLL_PAUSE) => {}
+                    }
+                    continue;
+                }
                 // Units never outnumber messages, and messages never outnumber
                 // the free permits, so each unit gets a permit.
                 for unit in units(fifo, messages) {
@@ -159,14 +170,15 @@ pub(crate) async fn run(ctx: WorkerCtx, spec: WorkerSpec) {
                         c.received += n;
                         c.in_flight += n;
                     });
+                    // Keeps `in_flight` right when a drain timeout aborts the
+                    // task, also before its first poll.
+                    let guard = InFlight {
+                        metrics: Arc::clone(&ctx.metrics),
+                        label: spec.label.clone(),
+                        left: std::sync::atomic::AtomicU64::new(n),
+                    };
                     let (ctx, spec) = (ctx.clone(), spec.clone());
                     tasks.spawn(async move {
-                        // Keeps `in_flight` right when a drain timeout aborts the task.
-                        let guard = InFlight {
-                            metrics: Arc::clone(&ctx.metrics),
-                            label: spec.label.clone(),
-                            left: std::sync::atomic::AtomicU64::new(n),
-                        };
                         handle_unit(&ctx, &spec, unit, received_at, &guard).await;
                         drop(guard);
                         drop(permit);

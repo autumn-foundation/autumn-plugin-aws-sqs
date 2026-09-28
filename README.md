@@ -55,7 +55,7 @@ AUTUMN_AWS_SQS__WORKER__MAX_IN_FLIGHT=32
 | `queues.<alias>` | none | Queue URL for an alias. |
 | `jobs.default_queue` | `"default"` | Alias or URL for jobs whose queue has no alias. |
 | `jobs.dead_letter_queue` | none | Alias or URL for dead letters from all workers. |
-| `worker.wait_time_secs` | 20 | Long-poll wait (0 to 20). |
+| `worker.wait_time_secs` | 20 | Long-poll wait (0 to 20). With 0, the worker pauses 1 s after an empty receive. |
 | `worker.max_messages` | 10 | Messages per receive (1 to 10). |
 | `worker.visibility_timeout_secs` | 30 | Visibility timeout (1 to 43 200). |
 | `worker.max_in_flight` | 16 | Handlers that run at the same time, per queue. |
@@ -123,7 +123,8 @@ flowchart TD
 
 - Delivery is at least once. Make handlers idempotent.
 - A dead letter has three attributes: `autumn-dead-letter-reason`, `autumn-source-queue`, and `autumn-attempts`. It keeps up to seven original attributes, so it stays in the SQS limit of 10. A message that is too large for these attributes goes without them.
-- The reason is 256 characters or less. It has no JSON input values. Bad `#[job]` args give the reason `job args deserialization failed`, with no retry.
+- The reason is 256 characters or less. It has no JSON input values.
+- Bad `#[job]` args go to the dead-letter path with no retry. The reason is `job args deserialization failed`, or for a versioned job the version error text. A payload from a newer version retries, because a newer worker can run it.
 - Without `jobs.dead_letter_queue`, set a redrive policy with `maxReceiveCount` equal to `max_attempts` or more.
 - Visibility changes stay in the 12 h limit of one receive. A handler that runs longer loses its heartbeat, and the message can run again.
 

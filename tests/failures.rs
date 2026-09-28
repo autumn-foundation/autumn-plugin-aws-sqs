@@ -656,3 +656,73 @@ async fn bad_job_args_are_poison_without_values() {
     assert_eq!(t.messages(DLQ)[0].attributes["autumn-attempts"], "1");
     rt.shutdown().await;
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct V2 {
+    pub name: String,
+}
+
+#[job(name = "h_versioned", version = 2)]
+async fn h_versioned(_state: AppState, _args: V2) -> AutumnResult<()> {
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn bad_versioned_args_are_poison_without_values() {
+    let t = memory();
+    let (_state, rt) = start_with(t.clone(), config(), |p| p.jobs(jobs![h_versioned])).await;
+    t.send(
+        JOBS,
+        OutboundMessage::new(
+            r#"{"v":1,"job":"h_versioned","payload":{"__autumn_schema_version":2,"args":{"name":"pii@example.com","x":1,"name2":7}},"enqueued_at":0}"#
+                .replace(r#""name":"pii@example.com","x":1,"name2":7"#, r#""name":["pii@example.com"]"#),
+        ),
+    )
+    .await
+    .unwrap();
+    wait_until(Duration::from_secs(10), || t.messages(DLQ).len() == 1).await;
+    let reason = &t.messages(DLQ)[0].attributes["autumn-dead-letter-reason"];
+    assert!(reason.contains("stored payload version 2"), "{reason}");
+    assert!(!reason.contains("pii@example.com"), "{reason}");
+    assert_eq!(t.messages(DLQ)[0].attributes["autumn-attempts"], "1");
+    rt.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn newer_payload_version_is_retried() {
+    let t = memory();
+    let (_state, rt) = start_with(t.clone(), config(), |p| p.jobs(jobs![h_versioned])).await;
+    t.send(
+        JOBS,
+        OutboundMessage::new(
+            r#"{"v":1,"job":"h_versioned","payload":{"__autumn_schema_version":3,"args":{"name":"a"}},"enqueued_at":0}"#,
+        ),
+    )
+    .await
+    .unwrap();
+    wait_until(Duration::from_secs(30), || {
+        rt.metrics()
+            .snapshot()
+            .get("default")
+            .is_some_and(|c| c.retried >= 1)
+    })
+    .await;
+    assert_eq!(rt.metrics().snapshot()["default"].poisoned, 0);
+    rt.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_wait_does_not_spin_on_an_empty_queue() {
+    // A worker that spins never yields, so time cannot move and this test hangs.
+    let t = memory();
+    let mut cfg = config();
+    cfg.worker.wait_time_secs = 0;
+    let consumer = SqsConsumer::new(
+        "zero_wait",
+        "events",
+        |_s: AppState, _m: SqsMessage| async { Ok(()) },
+    );
+    let (_state, rt) = start_with(t.clone(), cfg, |p| p.consumer(consumer)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    rt.shutdown().await;
+}
