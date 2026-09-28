@@ -116,7 +116,7 @@ pub const fn split_delay(remaining_secs: u64) -> DelaySplit {
 /// less, unless it holds one entry that is larger. Returns `start` only when
 /// `start >= sizes.len()`.
 #[must_use]
-pub fn batch_end(sizes: &[usize], start: usize, max_bytes: usize) -> usize {
+pub const fn batch_end(sizes: &[usize], start: usize, max_bytes: usize) -> usize {
     if start >= sizes.len() {
         return start;
     }
