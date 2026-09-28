@@ -7,6 +7,9 @@ use autumn_web::actuator::{HealthCheckOutput, HealthIndicator, HealthStatus, Ind
 use futures::future::BoxFuture;
 use serde_json::json;
 
+use std::time::Duration;
+
+use crate::error::SqsError;
 use crate::transport::SqsTransport;
 
 pub(crate) struct HealthTarget {
@@ -17,8 +20,9 @@ pub(crate) struct HealthTarget {
 
 /// Checks each queue with `GetQueueAttributes`.
 ///
-/// Status is `Up` when all queues answer, `Down` when one fails, and
-/// `Unknown` before the plugin starts.
+/// Status is `Up` when all queues answer and `Down` when one fails or takes
+/// more than 1.5 s. It is `Unknown` before the plugin starts. Details give
+/// counts and a short error class only.
 pub struct SqsHealth {
     target: OnceLock<HealthTarget>,
     readiness: bool,
@@ -47,6 +51,19 @@ impl SqsHealth {
     }
 }
 
+/// Time limit per queue check. It is under the 2 s indicator timeout.
+const CHECK_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+/// A short error class for public health output. It has no URL, account ID,
+/// or ARN.
+fn error_class(err: &SqsError) -> &'static str {
+    match err {
+        SqsError::QueueNotFound(_) => "not_found",
+        SqsError::Service(m) if m.contains("AccessDenied") => "access_denied",
+        _ => "error",
+    }
+}
+
 impl HealthIndicator for SqsHealth {
     fn check(&self) -> BoxFuture<'_, HealthCheckOutput> {
         Box::pin(async move {
@@ -56,22 +73,32 @@ impl HealthIndicator for SqsHealth {
                     details: HashMap::from([("reason".to_owned(), json!("not started"))]),
                 };
             };
+            let checks = target.queues.iter().map(|(label, url)| async move {
+                let result =
+                    tokio::time::timeout(CHECK_TIMEOUT, target.transport.queue_stats(url)).await;
+                (label.clone(), result)
+            });
             let mut details = HashMap::new();
             let mut up = true;
-            for (label, url) in &target.queues {
-                let detail = match target.transport.queue_stats(url).await {
-                    Ok(s) => json!({
+            for (label, result) in futures::future::join_all(checks).await {
+                let detail = match result {
+                    Ok(Ok(s)) => json!({
                         "visible": s.visible,
                         "in_flight": s.in_flight,
                         "delayed": s.delayed,
                         "redrive": s.redrive_target.is_some(),
                     }),
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         up = false;
-                        json!({ "error": e.to_string() })
+                        tracing::warn!(queue = %label, error = %e, "aws_sqs health check failed");
+                        json!({ "error": error_class(&e) })
+                    }
+                    Err(_) => {
+                        up = false;
+                        json!({ "error": "timeout" })
                     }
                 };
-                details.insert(label.clone(), detail);
+                details.insert(label, detail);
             }
             let out = if up {
                 HealthCheckOutput::up()
@@ -120,11 +147,11 @@ mod tests {
         });
         let out = h.check().await;
         assert_eq!(out.status, HealthStatus::Down);
+        assert_eq!(out.details["b"]["error"], "not_found");
         assert!(
-            out.details["b"]["error"]
-                .as_str()
+            !serde_json::to_string(&out.details)
                 .unwrap()
-                .contains("not found")
+                .contains("https://")
         );
         assert_eq!(out.details["a"]["visible"], 0);
     }

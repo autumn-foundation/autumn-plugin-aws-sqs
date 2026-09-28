@@ -21,7 +21,11 @@ use aws_sdk_sqs::types::QueueAttributeName;
 use serde::{Deserialize, Serialize};
 
 fn endpoint() -> Option<String> {
-    std::env::var("AWS_SQS_IT_ENDPOINT").ok()
+    let ep = std::env::var("AWS_SQS_IT_ENDPOINT").ok();
+    if ep.is_none() {
+        eprintln!("SKIP: set AWS_SQS_IT_ENDPOINT to run the SQS integration tests");
+    }
+    ep
 }
 
 fn unique(prefix: &str) -> String {
@@ -34,13 +38,11 @@ fn unique(prefix: &str) -> String {
 
 fn base_config(endpoint: &str) -> SqsConfig {
     // Exercise the named env var credential path.
-    let mut cfg = SqsConfig {
-        region: Some("us-east-1".into()),
-        endpoint: Some(endpoint.into()),
-        access_key_id_env: Some("AWS_ACCESS_KEY_ID".into()),
-        secret_access_key_env: Some("AWS_SECRET_ACCESS_KEY".into()),
-        ..SqsConfig::default()
-    };
+    let mut cfg = SqsConfig::default();
+    cfg.region = Some("us-east-1".into());
+    cfg.endpoint = Some(endpoint.into());
+    cfg.access_key_id_env = Some("AWS_ACCESS_KEY_ID".into());
+    cfg.secret_access_key_env = Some("AWS_SECRET_ACCESS_KEY".into());
     cfg.worker.wait_time_secs = 1;
     cfg.worker.visibility_timeout_secs = 5;
     cfg.worker.max_backoff_secs = 2;
@@ -96,7 +98,7 @@ async fn transport_round_trip() {
     assert_eq!(got[0].attributes["k"], "v");
 
     // Visibility expiry gives a new receive count.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     let again = t.receive(&q, opts).await.unwrap();
     assert_eq!(again[0].receive_count, Some(2));
     t.change_visibility(&q, &again[0].receipt_handle, 30)
@@ -234,7 +236,7 @@ async fn job_end_to_end_retry_dead_letter_and_delay() {
 
     let state = AppState::for_test();
     // No custom transport: the plugin builds the AWS client from config.
-    let rt = AwsSqsPlugin::new(cfg)
+    let rt = AwsSqsPlugin::with_config(cfg)
         .jobs(jobs![it_flaky, it_doomed, it_delayed])
         .start(&state)
         .await
@@ -277,7 +279,7 @@ async fn job_end_to_end_retry_dead_letter_and_delay() {
     assert_eq!(dead[0].attributes["autumn-attempts"], "2");
 
     let m = rt.metrics().snapshot();
-    assert!(m["default"].retried >= 2, "{m:?}");
+    assert_eq!(m["default"].retried, 2, "{m:?}");
     assert_eq!(m["default"].dead_lettered, 1);
     assert_eq!(
         rt.health().check().await.status,
@@ -290,4 +292,49 @@ async fn job_end_to_end_retry_dead_letter_and_delay() {
         s.visible + s.in_flight + s.delayed == 0
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fifo_consumer_keeps_group_order_on_real_sqs() {
+    use autumn_plugin_aws_sqs::{ConsumerError, SqsConsumer, SqsMessage};
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    static FAILED: AtomicU32 = AtomicU32::new(0);
+    let Some(ep) = endpoint() else { return };
+    let mut cfg = base_config(&ep);
+    let t = transport(&cfg).await;
+    let q = create_queue(&t, &format!("{}.fifo", unique("order")), true).await;
+    cfg.queues.insert("orders".into(), q.clone());
+    for n in 1..=5 {
+        t.send(
+            &q,
+            OutboundMessage::new(n.to_string())
+                .group_id("g")
+                .dedup_id(n.to_string()),
+        )
+        .await
+        .unwrap();
+    }
+    let consumer = SqsConsumer::new(
+        "orders",
+        "orders",
+        |_s: AppState, m: SqsMessage| async move {
+            if m.body == "1" && FAILED.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(ConsumerError::retry("first try fails"));
+            }
+            SEEN.lock().unwrap().push(m.body.clone());
+            Ok(())
+        },
+    )
+    .backoff_ms(1_000);
+    let rt = AwsSqsPlugin::with_config(cfg)
+        .consumer(consumer)
+        .start(&AppState::for_test())
+        .await
+        .unwrap();
+    wait_for(Duration::from_secs(60), async || {
+        SEEN.lock().unwrap().len() == 5
+    })
+    .await;
+    assert_eq!(*SEEN.lock().unwrap(), vec!["1", "2", "3", "4", "5"]);
+    rt.shutdown().await;
 }

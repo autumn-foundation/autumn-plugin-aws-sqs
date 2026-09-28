@@ -110,7 +110,7 @@ async fn start(
     jobs: Vec<autumn_web::job::JobInfo>,
 ) -> (AppState, autumn_plugin_aws_sqs::SqsRuntime) {
     let state = AppState::for_test();
-    let rt = AwsSqsPlugin::new(config())
+    let rt = AwsSqsPlugin::with_config(config())
         .with_transport(t.clone())
         .with_clock(common::clock())
         .jobs(jobs)
@@ -135,7 +135,7 @@ async fn enqueue_runs_same_handler_and_deletes() {
     .await;
     wait_until(Duration::from_secs(10), || t.messages(JOBS).is_empty()).await;
     let m = rt.metrics().snapshot();
-    assert!(m["default"].succeeded >= 1);
+    assert_eq!(m["default"].succeeded, 1);
     rt.shutdown().await;
 }
 
@@ -144,7 +144,7 @@ async fn enqueue_writes_job_envelope_and_attributes() {
     let t = transport();
     let state = AppState::for_test();
     // No workers: inspect the stored message.
-    let rt = AwsSqsPlugin::new(config())
+    let rt = AwsSqsPlugin::with_config(config())
         .with_transport(t.clone())
         .with_clock(common::clock())
         .jobs(jobs![ok_job])
@@ -221,6 +221,7 @@ async fn exhausted_job_goes_to_dead_letter_queue() {
     assert!(t.messages(JOBS).is_empty());
     let dead = &t.messages(DLQ)[0];
     assert!(dead.attributes["autumn-dead-letter-reason"].contains("always fails"));
+    assert_eq!(dead.attributes["autumn-source-queue"], JOBS);
     assert_eq!(dead.attributes["autumn-attempts"], "2");
     assert_eq!(rt.metrics().snapshot()["default"].dead_lettered, 1);
     rt.shutdown().await;
@@ -238,6 +239,8 @@ async fn panic_is_dead_lettered_at_once() {
     wait_until(Duration::from_secs(10), || t.messages(DLQ).len() == 1).await;
     assert!(t.messages(DLQ)[0].attributes["autumn-dead-letter-reason"].contains("panic"));
     assert_eq!(t.messages(DLQ)[0].attributes["autumn-attempts"], "1");
+    assert_eq!(rt.metrics().snapshot()["default"].poisoned, 1);
+    assert!(t.messages(JOBS).is_empty());
     // The worker keeps running after a panic.
     assert_eq!(rt.workers_running(), 1);
     rt.shutdown().await;
@@ -308,7 +311,7 @@ async fn queue_attribute_routes_to_alias_url() {
 async fn versioned_payload_is_wrapped_and_decoded() {
     let t = transport();
     let state = AppState::for_test();
-    let rt = AwsSqsPlugin::new(config())
+    let rt = AwsSqsPlugin::with_config(config())
         .with_transport(t.clone())
         .with_clock(common::clock())
         .jobs(jobs![versioned_job])
@@ -336,7 +339,7 @@ async fn versioned_payload_is_wrapped_and_decoded() {
 async fn short_delay_uses_delay_seconds() {
     let t = transport();
     let state = AppState::for_test();
-    let rt = AwsSqsPlugin::new(config())
+    let rt = AwsSqsPlugin::with_config(config())
         .with_transport(t.clone())
         .with_clock(common::clock())
         .jobs(jobs![delayed_job])
@@ -360,6 +363,7 @@ async fn long_delay_hops_until_due_without_using_attempts() {
     let t = transport();
     let (state, rt) = start(&t, jobs![delayed_job]).await;
     let client = SqsJobClient::from_state(&state).unwrap();
+    let start = tokio::time::Instant::now();
     client
         .enqueue_in("delayed_job", &Args { n: 1 }, Duration::from_secs(2_000))
         .await
@@ -372,8 +376,10 @@ async fn long_delay_hops_until_due_without_using_attempts() {
         DELAYED_SEEN.load(Ordering::SeqCst) == 1
     })
     .await;
+    assert!(start.elapsed() >= Duration::from_secs(2_000));
     let m = rt.metrics().snapshot();
-    assert!(m["default"].hops >= 2, "{:?}", m["default"]);
+    // 2 000 s = 900 + 900 + 200: two hops, then the run.
+    assert_eq!(m["default"].hops, 2, "{:?}", m["default"]);
     assert_eq!(m["default"].retried, 0);
     rt.shutdown().await;
 }
@@ -402,7 +408,7 @@ async fn fifo_queue_rejects_delay_and_sets_group() {
     let mut cfg = config();
     cfg.queues.insert("default".into(), FIFO.into());
     let state = AppState::for_test();
-    let rt = AwsSqsPlugin::new(cfg)
+    let rt = AwsSqsPlugin::with_config(cfg)
         .with_transport(t.clone())
         .with_clock(common::clock())
         .jobs(jobs![ok_job])
@@ -469,7 +475,7 @@ async fn missing_default_queue_fails_start() {
     let t = transport();
     let mut cfg = config();
     cfg.queues.remove("default");
-    let err = AwsSqsPlugin::new(cfg)
+    let err = AwsSqsPlugin::with_config(cfg)
         .with_transport(t)
         .with_clock(common::clock())
         .jobs(jobs![ok_job])
@@ -485,7 +491,7 @@ async fn missing_default_queue_fails_start() {
 #[tokio::test(start_paused = true)]
 async fn duplicate_job_names_fail_start() {
     let t = transport();
-    let err = AwsSqsPlugin::new(config())
+    let err = AwsSqsPlugin::with_config(config())
         .with_transport(t)
         .with_clock(common::clock())
         .jobs(jobs![ok_job, ok_job])

@@ -9,6 +9,10 @@ pub const MAX_DELAY_SECS: u64 = 900;
 pub const MAX_VISIBILITY_SECS: u64 = 43_200;
 /// SQS limit for entries in one batch request.
 pub const MAX_BATCH: usize = 10;
+/// SQS limit for the total payload of one batch request (1 MiB).
+pub const MAX_BATCH_BYTES: usize = 1_048_576;
+/// Safety margin under the 12 h visibility budget of one receive.
+pub const VISIBILITY_MARGIN_SECS: u64 = 5;
 
 /// Decision after a handler fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,21 +47,42 @@ pub const fn attempt_from_receive_count(count: Option<u32>) -> u32 {
 /// The step is `initial_ms * 2^(attempt - 1)`. The result is never above
 /// `max_secs`. `max_secs` is clamped to [`MAX_VISIBILITY_SECS`].
 #[must_use]
-pub fn backoff_secs(initial_ms: u64, attempt: u32, max_secs: u64) -> u64 {
+pub const fn backoff_secs(initial_ms: u64, attempt: u32, max_secs: u64) -> u64 {
     let max_secs = if max_secs < MAX_VISIBILITY_SECS {
         max_secs
     } else {
         MAX_VISIBILITY_SECS
     };
     let cap_ms = max_secs * 1000;
-    let mut ms = initial_ms.min(cap_ms);
+    let mut ms = if initial_ms < cap_ms {
+        initial_ms
+    } else {
+        cap_ms
+    };
     let mut i: u32 = 1;
     // Stop early at 0 or at the cap: later steps do not change the value.
     while i < attempt && ms != 0 && ms != cap_ms {
-        ms = ms.saturating_mul(2).min(cap_ms);
+        ms = if ms <= cap_ms / 2 { ms * 2 } else { cap_ms };
         i += 1;
     }
-    ms.div_ceil(1000)
+    let q = ms / 1000;
+    let r = ms % 1000;
+    if r == 0 { q } else { q + 1 }
+}
+
+/// Largest visibility timeout that SQS accepts now.
+///
+/// SQS allows 12 h of visibility from the receive. `elapsed_secs` is the time
+/// since the receive. The result is never above `requested`. A result of 0
+/// means the budget is spent.
+#[must_use]
+pub const fn clamp_visibility(requested: u64, elapsed_secs: u64) -> u64 {
+    let used = elapsed_secs.saturating_add(VISIBILITY_MARGIN_SECS);
+    if used >= MAX_VISIBILITY_SECS {
+        return 0;
+    }
+    let left = MAX_VISIBILITY_SECS - used;
+    if requested < left { requested } else { left }
 }
 
 /// Delay to send now, and the part that stays for later hops.
@@ -85,29 +110,31 @@ pub const fn split_delay(remaining_secs: u64) -> DelaySplit {
     }
 }
 
-/// Number of batches for `n` entries.
-#[must_use]
-pub const fn batch_count(n: usize) -> usize {
-    n.div_ceil(MAX_BATCH)
-}
-
-/// Bounds `[start, end)` of batch `k` for `n` entries.
+/// End (exclusive) of the batch that starts at `start`.
 ///
-/// Returns `None` when batch `k` does not exist.
+/// A batch has 1 to [`MAX_BATCH`] entries. Its total size is `max_bytes` or
+/// less, unless it holds one entry that is larger. Returns `start` only when
+/// `start >= sizes.len()`.
 #[must_use]
-pub const fn batch_bounds(n: usize, k: usize) -> Option<(usize, usize)> {
-    let Some(start) = k.checked_mul(MAX_BATCH) else {
-        return None;
-    };
-    if start >= n {
-        return None;
+pub fn batch_end(sizes: &[usize], start: usize, max_bytes: usize) -> usize {
+    if start >= sizes.len() {
+        return start;
     }
-    let end = if n - start <= MAX_BATCH {
-        n
-    } else {
-        start + MAX_BATCH
-    };
-    Some((start, end))
+    let mut end = start;
+    let mut total: usize = 0;
+    while end < sizes.len() && end - start < MAX_BATCH {
+        let size = sizes[end];
+        if size > max_bytes - total {
+            if end == start {
+                // One entry over the limit goes alone. SQS rejects it per entry.
+                return start + 1;
+            }
+            break;
+        }
+        total += size;
+        end += 1;
+    }
+    end
 }
 
 /// Interval between visibility extensions: half the timeout, 1 s or more.
@@ -213,15 +240,80 @@ mod tests {
     }
 
     #[test]
-    fn batches_cover_edges() {
-        assert_eq!(batch_count(0), 0);
-        assert_eq!(batch_count(1), 1);
-        assert_eq!(batch_count(10), 1);
-        assert_eq!(batch_count(11), 2);
-        assert_eq!(batch_bounds(11, 0), Some((0, 10)));
-        assert_eq!(batch_bounds(11, 1), Some((10, 11)));
-        assert_eq!(batch_bounds(11, 2), None);
-        assert_eq!(batch_bounds(0, 0), None);
+    fn batch_end_splits_by_count() {
+        let sizes = [1usize; 11];
+        assert_eq!(batch_end(&sizes, 0, MAX_BATCH_BYTES), 10);
+        assert_eq!(batch_end(&sizes, 10, MAX_BATCH_BYTES), 11);
+        assert_eq!(batch_end(&sizes, 11, MAX_BATCH_BYTES), 11);
+        assert_eq!(batch_end(&[], 0, MAX_BATCH_BYTES), 0);
+    }
+
+    #[test]
+    fn batch_end_splits_by_bytes() {
+        // Four 300 KB entries: SQS rejects them in one request.
+        let sizes = [300_000usize; 4];
+        assert_eq!(batch_end(&sizes, 0, MAX_BATCH_BYTES), 3);
+        assert_eq!(batch_end(&sizes, 3, MAX_BATCH_BYTES), 4);
+    }
+
+    #[test]
+    fn batch_end_takes_one_oversize_entry_alone() {
+        let sizes = [5usize, 20, 5];
+        assert_eq!(batch_end(&sizes, 0, 10), 1);
+        assert_eq!(batch_end(&sizes, 1, 10), 2);
+        assert_eq!(batch_end(&sizes, 2, 10), 3);
+    }
+
+    #[test]
+    fn clamp_visibility_keeps_budget() {
+        assert_eq!(clamp_visibility(30, 0), 30);
+        assert_eq!(
+            clamp_visibility(43_200, 0),
+            MAX_VISIBILITY_SECS - VISIBILITY_MARGIN_SECS
+        );
+        assert_eq!(clamp_visibility(30, 43_190), 5);
+        assert_eq!(clamp_visibility(30, 43_195), 0);
+        assert_eq!(clamp_visibility(30, u64::MAX), 0);
+    }
+
+    /// The constants in `verus/policy.rs` match this file.
+    #[test]
+    fn verus_constants_match() {
+        let spec = include_str!("../verus/policy.rs");
+        for line in [
+            format!(
+                "pub const MAX_DELAY_SECS: u64 = {};",
+                fmt_num(MAX_DELAY_SECS)
+            ),
+            format!(
+                "pub const MAX_VISIBILITY_SECS: u64 = {};",
+                fmt_num(MAX_VISIBILITY_SECS)
+            ),
+            format!("pub const MAX_BATCH: usize = {MAX_BATCH};"),
+            format!(
+                "pub const MAX_BATCH_BYTES: usize = {};",
+                fmt_num(MAX_BATCH_BYTES as u64)
+            ),
+            format!("pub const VISIBILITY_MARGIN_SECS: u64 = {VISIBILITY_MARGIN_SECS};"),
+        ] {
+            assert!(spec.contains(&line), "verus/policy.rs lacks: {line}");
+        }
+    }
+
+    /// Formats like rustfmt source: `43_200`.
+    fn fmt_num(n: u64) -> String {
+        let digits = n.to_string();
+        if digits.len() <= 3 {
+            return digits;
+        }
+        let mut out = String::new();
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                out.push('_');
+            }
+            out.push(c);
+        }
+        out
     }
 
     #[test]
@@ -263,26 +355,50 @@ mod tests {
             }
         }
 
-        // The batches cover 0..n exactly once, in order, each 1..=10 long.
+        // Batches cover all entries in order. Each has 1..=10 entries and fits
+        // the byte limit, or is one oversize entry.
         #[test]
-        fn prop_batches_cover_exactly(n in 0usize..500) {
-            let mut next = 0;
-            for k in 0..batch_count(n) {
-                let (start, end) = batch_bounds(n, k).expect("batch exists");
-                prop_assert_eq!(start, next);
-                prop_assert!(end > start && end - start <= MAX_BATCH);
-                next = end;
+        fn prop_batches_cover_exactly(sizes in proptest::collection::vec(0usize..400_000, 0..60), max in 1usize..=MAX_BATCH_BYTES) {
+            let mut start = 0;
+            while start < sizes.len() {
+                let end = batch_end(&sizes, start, max);
+                prop_assert!(end > start && end <= sizes.len());
+                prop_assert!(end - start <= MAX_BATCH);
+                let total: usize = sizes[start..end].iter().sum();
+                prop_assert!(total <= max || end - start == 1);
+                start = end;
             }
-            prop_assert_eq!(next, n);
-            prop_assert!(batch_bounds(n, batch_count(n)).is_none());
+            prop_assert_eq!(batch_end(&sizes, sizes.len(), max), sizes.len());
+        }
+
+        #[test]
+        fn prop_backoff_clamps_large_max(initial in any::<u64>(), attempt in any::<u32>(), max in MAX_VISIBILITY_SECS..=u64::MAX) {
+            prop_assert_eq!(backoff_secs(initial, attempt, max), backoff_secs(initial, attempt, MAX_VISIBILITY_SECS));
+        }
+
+        #[test]
+        fn prop_clamp_visibility(requested in any::<u64>(), elapsed in any::<u64>()) {
+            let v = clamp_visibility(requested, elapsed);
+            prop_assert!(v <= requested);
+            prop_assert!(u128::from(v) + u128::from(elapsed) + u128::from(VISIBILITY_MARGIN_SECS) <= u128::from(MAX_VISIBILITY_SECS) || v == 0);
         }
 
         #[test]
         fn prop_heartbeat(v in any::<u64>()) {
             let s = heartbeat_interval_secs(v);
-            prop_assert!(s >= 1);
             if v >= 2 {
-                prop_assert!(s * 2 <= v);
+                prop_assert_eq!(s, v / 2);
+            } else {
+                prop_assert_eq!(s, 1);
+            }
+        }
+
+        #[test]
+        fn prop_attempt(count in proptest::option::of(any::<u32>())) {
+            let a = attempt_from_receive_count(count);
+            match count {
+                Some(c) if c >= 1 => prop_assert_eq!(a, c),
+                _ => prop_assert_eq!(a, 1),
             }
         }
     }

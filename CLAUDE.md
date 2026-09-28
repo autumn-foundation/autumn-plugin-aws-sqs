@@ -6,7 +6,7 @@ Amazon SQS plugin for autumn-web 0.7. Style for all docs and comments: ASD-STE10
 
 | Path | Contents |
 |---|---|
-| `src/policy.rs` | Verified core: retry decision, backoff, delay split, batch bounds, heartbeat. Pure. |
+| `src/policy.rs` | Verified core: retry decision, backoff, delay split, batch bounds, visibility clamp, heartbeat. Pure. |
 | `verus/policy.rs` | Verus spec and proofs for `src/policy.rs`. Keep both in step. |
 | `src/transport/` | `SqsTransport` trait, `AwsSqsTransport` (SDK), `MemoryTransport` (fake). |
 | `src/config.rs` | `[aws_sqs]` config, profile file, `AUTUMN_AWS_SQS__*` env overlay. |
@@ -17,7 +17,7 @@ Amazon SQS plugin for autumn-web 0.7. Style for all docs and comments: ASD-STE10
 | `src/worker.rs` | Receive loop, heartbeat, retry, dead letter, drain. |
 | `src/health.rs`, `src/metrics.rs` | Actuator health and Prometheus metrics. |
 | `src/plugin.rs` | `AwsSqsPlugin`, `SqsRuntime`. |
-| `tests/` | `jobs.rs`, `runtime.rs` (fake, paused time), `localstack.rs` (real API). |
+| `tests/` | `jobs.rs`, `runtime.rs`, `failures.rs` (fake, paused time), `load.rs` (config files), `localstack.rs` (real API). `common/` has `FaultyTransport`. |
 | `docs/` | `plan.md`, ADRs. |
 
 ## Commands
@@ -39,6 +39,8 @@ verus verus/policy.rs
 - Write the test first. See it fail. Then write the code.
 - A change to `src/policy.rs` needs the same change in `verus/policy.rs`. Run Verus.
 - Only `src/transport/` calls SQS. Other code uses `SqsTransport`.
+- `MemoryTransport` must follow real SQS. Check a new rule against LocalStack first.
+- A metrics label is an alias or a consumer name. Never a raw URL.
 - No `unwrap` or `expect` in `src/` outside tests.
 - Time in tests: `#[tokio::test(start_paused = true)]` and `tests/common::clock()`.
 - Workers start only when `state.role().runs_workers()` is true.

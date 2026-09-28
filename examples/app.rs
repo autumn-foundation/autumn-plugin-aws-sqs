@@ -19,7 +19,7 @@ pub struct WelcomeArgs {
     pub user_id: i64,
 }
 
-/// Sends a welcome email. Retries 5 times, then goes to the DLQ.
+/// Sends a welcome email. Runs up to 5 times, then goes to the DLQ.
 #[job(name = "send_welcome_email", max_attempts = 5, backoff_ms = 1000)]
 async fn send_welcome_email(_state: AppState, args: WelcomeArgs) -> AutumnResult<()> {
     tracing::info!(user_id = args.user_id, "welcome email sent");
@@ -56,7 +56,7 @@ async fn main() {
     autumn_web::app()
         .routes(routes![signup])
         .plugin(
-            AwsSqsPlugin::from_autumn_toml()
+            AwsSqsPlugin::new()
                 .jobs(jobs![send_welcome_email])
                 .consumer(SqsConsumer::new("uploads", "uploads", on_upload).max_attempts(3)),
         )

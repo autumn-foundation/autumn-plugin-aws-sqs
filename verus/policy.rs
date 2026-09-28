@@ -13,6 +13,10 @@ pub const MAX_DELAY_SECS: u64 = 900;
 pub const MAX_VISIBILITY_SECS: u64 = 43_200;
 /// SQS limit for entries in one batch.
 pub const MAX_BATCH: usize = 10;
+/// SQS limit for the total payload of one batch request.
+pub const MAX_BATCH_BYTES: usize = 1_048_576;
+/// Safety margin under the 12 h visibility budget of one receive.
+pub const VISIBILITY_MARGIN_SECS: u64 = 5;
 
 // ---------------------------------------------------------------- attempts
 
@@ -39,6 +43,7 @@ pub fn attempt_from_receive_count(count: Option<u32>) -> (a: u32)
     ensures
         a >= 1,
         count matches Some(c) && c >= 1 ==> a == count->Some_0,
+        (count is None || count->Some_0 == 0) ==> a == 1,
 {
     match count {
         Some(c) if c >= 1 => c,
@@ -112,6 +117,52 @@ proof fn lemma_fixed_point(initial_ms: int, i: int, j: int, cap_ms: int)
 {
     if j > i {
         lemma_fixed_point(initial_ms, i, j - 1, cap_ms);
+    }
+}
+
+/// Closed form: `spec_backoff_ms == min(initial * 2^(attempt - 1), cap)`.
+/// The property tests in `src/policy.rs` use this form as the oracle.
+proof fn lemma_backoff_closed_form(initial_ms: int, attempt: int, cap_ms: int)
+    requires
+        initial_ms >= 0,
+        cap_ms >= 0,
+        attempt >= 1,
+    ensures
+        spec_backoff_ms(initial_ms, attempt, cap_ms) == spec_min(
+            initial_ms * vstd::arithmetic::power2::pow2((attempt - 1) as nat) as int,
+            cap_ms,
+        ),
+    decreases attempt,
+{
+    vstd::arithmetic::power2::lemma_pow2_pos((attempt - 1) as nat);
+    if attempt == 1 {
+        vstd::arithmetic::power2::lemma2_to64();
+        assert(initial_ms * vstd::arithmetic::power2::pow2(0) as int == initial_ms);
+    }
+    if attempt > 1 {
+        lemma_backoff_closed_form(initial_ms, attempt - 1, cap_ms);
+        let p = vstd::arithmetic::power2::pow2((attempt - 2) as nat) as int;
+        vstd::arithmetic::power2::lemma_pow2_unfold((attempt - 1) as nat);
+        vstd::arithmetic::power2::lemma_pow2_pos((attempt - 2) as nat);
+        assert(vstd::arithmetic::power2::pow2((attempt - 1) as nat) as int == 2 * p);
+        let x = initial_ms * p;
+        assert(initial_ms * (2 * p) == 2 * x) by (nonlinear_arith)
+            requires
+                x == initial_ms * p,
+        ;
+        assert(x >= 0) by (nonlinear_arith)
+            requires
+                initial_ms >= 0,
+                p > 0,
+                x == initial_ms * p,
+        ;
+        // min(2 * min(x, cap), cap) == min(2x, cap) for x, cap >= 0.
+        assert(spec_min(2 * spec_min(x, cap_ms), cap_ms) == spec_min(2 * x, cap_ms));
+        assert(spec_backoff_ms(initial_ms, attempt, cap_ms) == spec_min(
+            spec_backoff_ms(initial_ms, attempt - 1, cap_ms) * 2,
+            cap_ms,
+        ));
+        assert(initial_ms * vstd::arithmetic::power2::pow2((attempt - 1) as nat) as int == 2 * x);
     }
 }
 
@@ -198,38 +249,73 @@ pub fn split_delay(remaining_secs: u64) -> (d: DelaySplit)
 
 // ------------------------------------------------------------------- batch
 
-/// Number of batches for `n` entries.
-pub fn batch_count(n: usize) -> (c: usize)
-    ensures
-        c * MAX_BATCH >= n,
-        n > 0 ==> (c - 1) * MAX_BATCH < n,
-        n == 0 ==> c == 0,
+/// Spec: total of `s[lo..hi]`.
+pub open spec fn spec_sum(s: Seq<usize>, lo: int, hi: int) -> int
+    decreases hi - lo,
 {
-    if n == 0 { 0 } else { (n - 1) / MAX_BATCH + 1 }
+    if hi <= lo { 0 } else { spec_sum(s, lo, hi - 1) + s[hi - 1] }
 }
 
-/// Bounds of batch `k`: `[start, end)`. `None` when batch `k` does not exist.
-pub fn batch_bounds(n: usize, k: usize) -> (r: Option<(usize, usize)>)
+/// End (exclusive) of the batch that starts at `start`.
+pub fn batch_end(sizes: &[usize], start: usize, max_bytes: usize) -> (end: usize)
     ensures
-        (k * MAX_BATCH < n) == r.is_some(),
-        r matches Some((start, end)) ==> {
-            &&& start == k * MAX_BATCH
-            &&& start < end
-            &&& end <= n
+        start >= sizes.len() ==> end == start,
+        start < sizes.len() ==> {
+            // Progress, bounds, count limit.
+            &&& start < end <= sizes.len()
             &&& end - start <= MAX_BATCH
-            // Contiguous cover: a batch is full unless it is the last one.
-            &&& (end < n ==> end == (k + 1) * MAX_BATCH)
+            // Byte limit, unless one entry is larger than the limit.
+            &&& (spec_sum(sizes@, start as int, end as int) <= max_bytes || end == start + 1)
         },
 {
-    let start = match k.checked_mul(MAX_BATCH) {
-        Some(s) => s,
-        None => return None,
-    };
-    if start >= n {
-        return None;
+    if start >= sizes.len() {
+        return start;
     }
-    let end = if n - start <= MAX_BATCH { n } else { start + MAX_BATCH };
-    Some((start, end))
+    let mut end = start;
+    let mut total: usize = 0;
+    while end < sizes.len() && end - start < MAX_BATCH
+        invariant
+            start < sizes.len(),
+            start <= end <= sizes.len(),
+            end - start <= MAX_BATCH,
+            total <= max_bytes,
+            total as int == spec_sum(sizes@, start as int, end as int),
+        ensures
+            start < end <= sizes.len(),
+            end - start <= MAX_BATCH,
+            total <= max_bytes,
+            total as int == spec_sum(sizes@, start as int, end as int),
+        decreases sizes.len() - end,
+    {
+        let size = sizes[end];
+        if size > max_bytes - total {
+            if end == start {
+                return start + 1;
+            }
+            break;
+        }
+        total = total + size;
+        end = end + 1;
+    }
+    end
+}
+
+// -------------------------------------------------------------- visibility
+
+/// Largest visibility timeout that SQS accepts now.
+pub fn clamp_visibility(requested: u64, elapsed_secs: u64) -> (v: u64)
+    ensures
+        v <= requested,
+        v > 0 ==> v + elapsed_secs + VISIBILITY_MARGIN_SECS <= MAX_VISIBILITY_SECS,
+        // No needless clamp: a request inside the budget passes unchanged.
+        requested + elapsed_secs + VISIBILITY_MARGIN_SECS <= MAX_VISIBILITY_SECS ==> v == requested,
+{
+    let used = elapsed_secs.saturating_add(VISIBILITY_MARGIN_SECS);
+    if used >= MAX_VISIBILITY_SECS {
+        return 0;
+    }
+    let left = MAX_VISIBILITY_SECS - used;
+    if requested < left { requested } else { left }
 }
 
 // --------------------------------------------------------------- heartbeat
@@ -237,8 +323,8 @@ pub fn batch_bounds(n: usize, k: usize) -> (r: Option<(usize, usize)>)
 /// Interval between visibility extensions: half the timeout, 1 s or more.
 pub fn heartbeat_interval_secs(visibility_secs: u64) -> (s: u64)
     ensures
-        s >= 1,
-        visibility_secs >= 2 ==> s * 2 <= visibility_secs,
+        visibility_secs >= 2 ==> s == visibility_secs / 2,
+        visibility_secs < 2 ==> s == 1,
 {
     if visibility_secs / 2 >= 1 { visibility_secs / 2 } else { 1 }
 }

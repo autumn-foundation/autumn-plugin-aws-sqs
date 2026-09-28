@@ -33,7 +33,7 @@ fn transport() -> MemoryTransport {
 }
 
 fn plugin(t: &MemoryTransport) -> AwsSqsPlugin {
-    AwsSqsPlugin::new(config())
+    AwsSqsPlugin::with_config(config())
         .with_transport(t.clone())
         .with_clock(common::clock())
 }
@@ -85,7 +85,10 @@ async fn consumer_bad_json_is_rejected_to_dead_letter() {
         .unwrap();
     t.send(EVENTS, OutboundMessage::new("{oops")).await.unwrap();
     wait_until(Duration::from_secs(10), || t.messages(DLQ).len() == 1).await;
-    assert_eq!(rt.metrics().snapshot()["strict"].poisoned, 1);
+    let m = rt.metrics().snapshot();
+    assert_eq!(m["strict"].poisoned, 1);
+    assert_eq!(m["strict"].dead_lettered, 1);
+    assert!(t.messages(EVENTS).is_empty());
     rt.shutdown().await;
 }
 
@@ -111,6 +114,10 @@ async fn consumer_retry_error_uses_consumer_attempts() {
     t.send(EVENTS, OutboundMessage::new("x")).await.unwrap();
     wait_until(Duration::from_secs(60), || t.messages(DLQ).len() == 1).await;
     assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+    let m = rt.metrics().snapshot();
+    assert_eq!(m["retrying"].retried, 2);
+    assert_eq!(m["retrying"].dead_lettered, 1);
+    assert!(t.messages(EVENTS).is_empty());
     rt.shutdown().await;
 }
 
@@ -355,7 +362,10 @@ async fn shutdown_stops_receiving() {
         .start(&AppState::for_test())
         .await
         .unwrap();
+    assert_eq!(rt.workers_running(), 1);
+    let running = rt.running_handle();
     rt.shutdown().await;
+    assert_eq!(running.load(std::sync::atomic::Ordering::SeqCst), 0);
     t.send(EVENTS, OutboundMessage::new("late")).await.unwrap();
     tokio::time::sleep(Duration::from_secs(30)).await;
     assert_eq!(CALLS.load(Ordering::SeqCst), 0);
@@ -392,7 +402,7 @@ async fn metrics_source_exports_families() {
     let families = rt.metrics().collect();
     let sent = families
         .iter()
-        .find(|f| f.name == "autumn_sqs_messages_sent_total")
+        .find(|f| f.name == "aws_sqs_messages_sent_total")
         .expect("sent family");
     assert!(matches!(sent.kind, MetricKind::Counter));
     assert!(
@@ -409,7 +419,7 @@ async fn stats_sampler_exports_queue_depth() {
     let mut cfg = config();
     cfg.worker.stats_interval_secs = 5;
     let state = AppState::for_test();
-    let rt = AwsSqsPlugin::new(cfg)
+    let rt = AwsSqsPlugin::with_config(cfg)
         .with_transport(t.clone())
         .with_clock(common::clock())
         .start_with_role(&state, autumn_web::ProcessRole::Web)
@@ -421,7 +431,7 @@ async fn stats_sampler_exports_queue_depth() {
         .metrics()
         .collect()
         .into_iter()
-        .find(|f| f.name == "autumn_sqs_queue_messages")
+        .find(|f| f.name == "aws_sqs_queue_messages")
         .expect("depth family");
     assert!(depth.samples.iter().any(|s| {
         s.labels.contains(&("queue".into(), "events".into()))
@@ -471,12 +481,13 @@ async fn plugin_installs_with_one_call() {
     let health = client.get("/actuator/health").send().await;
     let body = health.text();
     assert!(body.contains("aws_sqs"), "{body}");
+    assert!(body.contains("UP"), "{body}");
 }
 
 #[test]
 fn plugin_name_is_stable() {
     use autumn_web::plugin::Plugin;
-    let p = AwsSqsPlugin::new(config()).with_transport(MemoryTransport::new());
+    let p = AwsSqsPlugin::with_config(config()).with_transport(MemoryTransport::new());
     assert_eq!(p.name(), "autumn-plugin-aws-sqs");
 }
 
@@ -484,7 +495,7 @@ fn plugin_name_is_stable() {
 async fn custom_transport_arc_is_accepted() {
     let t: Arc<dyn SqsTransport> = Arc::new(transport());
     let state = AppState::for_test();
-    let rt = AwsSqsPlugin::new(config())
+    let rt = AwsSqsPlugin::with_config(config())
         .with_transport_arc(t)
         .start(&state)
         .await

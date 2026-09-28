@@ -39,12 +39,18 @@ impl AwsSqsTransport {
     /// env var.
     pub async fn from_config(config: &SqsConfig) -> Result<Self, SqsError> {
         config.validate()?;
-        let credentials = config.credentials(|var| std::env::var(var).ok())?;
+        let credentials = config.credentials(crate::config::env_var)?;
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         if let Some(region) = &config.region {
             loader = loader.region(aws_config::Region::new(region.clone()));
         }
         if let Some(endpoint) = &config.endpoint {
+            if is_plain_http_remote(endpoint) {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    "aws_sqs: the endpoint uses plain http to a remote host; messages are not encrypted"
+                );
+            }
             loader = loader.endpoint_url(endpoint);
         }
         if let Some((key, secret)) = credentials {
@@ -64,6 +70,15 @@ impl AwsSqsTransport {
     pub const fn client(&self) -> &Client {
         &self.client
     }
+}
+
+/// Returns `true` for an `http://` URL whose host is not loopback.
+fn is_plain_http_remote(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let host = rest.split(['/', ':']).next().unwrap_or_default();
+    !matches!(host, "localhost" | "127.0.0.1" | "[") && !host.starts_with("127.")
 }
 
 /// Maps an SQS error code to [`SqsError`].
@@ -227,6 +242,7 @@ impl SqsTransport for AwsSqsTransport {
                 .wait_time_seconds(to_i32(options.wait_secs, "WaitTimeSeconds")?)
                 .visibility_timeout(to_i32(options.visibility_secs, "VisibilityTimeout")?)
                 .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
+                .message_system_attribute_names(MessageSystemAttributeName::MessageGroupId)
                 .message_attribute_names("All")
                 .send()
                 .await
@@ -242,6 +258,7 @@ impl SqsTransport for AwsSqsTransport {
                         .attributes()
                         .and_then(|a| a.get(&MessageSystemAttributeName::ApproximateReceiveCount))
                         .and_then(|v| v.parse().ok()),
+                    // String and Number attributes keep their text. Binary ones drop.
                     attributes: m.message_attributes().map_or_else(BTreeMap::new, |a| {
                         a.iter()
                             .filter_map(|(k, v)| {
@@ -249,6 +266,10 @@ impl SqsTransport for AwsSqsTransport {
                             })
                             .collect()
                     }),
+                    group_id: m
+                        .attributes()
+                        .and_then(|a| a.get(&MessageSystemAttributeName::MessageGroupId))
+                        .cloned(),
                 })
                 .collect())
         })
@@ -397,5 +418,58 @@ mod tests {
         assert_eq!(a["k"].data_type(), "String");
         assert_eq!(a["k"].string_value(), Some("v"));
         assert!(attributes(&OutboundMessage::new("b")).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn from_config_rejects_partial_credentials() {
+        let cfg = SqsConfig {
+            access_key_id_env: Some("AUTUMN_SQS_TEST_ONLY_KEY".into()),
+            ..SqsConfig::default()
+        };
+        let err = AwsSqsTransport::from_config(&cfg).await.unwrap_err();
+        assert!(
+            matches!(err, SqsError::Config(ref m) if m.contains("both")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_config_names_missing_env_var() {
+        let cfg = SqsConfig {
+            access_key_id_env: Some("AUTUMN_SQS_TEST_MISSING_KEY_8F2A".into()),
+            secret_access_key_env: Some("AUTUMN_SQS_TEST_MISSING_SECRET_8F2A".into()),
+            ..SqsConfig::default()
+        };
+        let err = AwsSqsTransport::from_config(&cfg).await.unwrap_err();
+        assert!(
+            matches!(err, SqsError::Config(ref m) if m.contains("AUTUMN_SQS_TEST_MISSING_KEY_8F2A")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_config_builds_with_region_and_endpoint() {
+        let cfg = SqsConfig {
+            region: Some("eu-west-1".into()),
+            endpoint: Some("http://localhost:9".into()),
+            ..SqsConfig::default()
+        };
+        let t = AwsSqsTransport::from_config(&cfg).await.unwrap();
+        assert_eq!(
+            t.client()
+                .config()
+                .region()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("eu-west-1")
+        );
+    }
+
+    #[test]
+    fn plain_http_remote_is_detected() {
+        assert!(is_plain_http_remote("http://sqs.example.com/1/q"));
+        assert!(!is_plain_http_remote("http://localhost:4566"));
+        assert!(!is_plain_http_remote("http://127.0.0.1:4566"));
+        assert!(!is_plain_http_remote("https://sqs.us-east-1.amazonaws.com"));
     }
 }

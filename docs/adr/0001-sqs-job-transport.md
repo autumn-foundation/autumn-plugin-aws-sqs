@@ -24,10 +24,12 @@ Option 1.
 
 - Option 1 needs no upstream change. It keeps the `#[job]` function, name,
   retry settings, queue, and payload version.
-- `JobContext::current()` gives a no-op context outside the autumn runtime,
-  so a direct `handler` call is safe.
+- `JobContext::current()` returns a no-op context outside the autumn runtime.
+  The plugin can call `handler` directly.
+- The plugin reads the app `JobInterceptor` from the app state. It wraps each
+  SQS enqueue and run with it.
 - Option 2 loses the due time. `intercept_enqueue` gets only the name and the
-  payload. A delayed job would run at once. It also takes the single
+  payload. A delayed job runs immediately. It also takes the single
   interceptor slot from the app.
 - Option 3 is a fork to maintain.
 
@@ -38,8 +40,14 @@ Option 1.
   `XJob::enqueue(args)`.
 - Bad: `unique`, `concurrency`, tracked jobs, and the admin jobs page do not
   apply to SQS jobs.
+- Bad: the event scope that autumn sets for a job run is `pub(crate)`. An
+  `events::publish` in an SQS job uses the process event bus.
+- Bad: a split `web`/`worker` topology must set `[jobs] backend` to `postgres`
+  or `redis`. autumn stops at boot otherwise. See "Upstream seams" item 2.
 
-## Future: upstream seam
+## Upstream seams (proposed)
+
+### 1. Job backend trait
 
 If autumn-web adds a job backend trait, this plugin can become a backend.
 Then `XJob::enqueue`, tracked jobs, and the admin page work with SQS.
@@ -74,3 +82,18 @@ pub struct EnqueueRequest {
 
 The autumn runtime keeps retry math, uniqueness, tracking, and metrics.
 The backend only stores, claims, and settles.
+
+### 2. Split-role check for plugin backends
+
+`app.rs` calls `split_role_requires_durable_backend(role, &config.jobs.backend)`
+and exits when the role is `web` or `worker` and the backend is not `postgres`
+or `redis`. It does this also when the app registers no autumn jobs.
+
+Proposed change, either one:
+
+- Skip the check when the app registers no autumn jobs and no durable listeners.
+- Accept `backend = "external"`: a plugin owns the jobs, and autumn starts none.
+
+Until then, the README tells users to set `backend = "redis"` with no autumn
+jobs. We checked this with the example app: a `web` process and a `worker`
+process ran against LocalStack.

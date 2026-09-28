@@ -16,12 +16,15 @@ use crate::policy::MAX_VISIBILITY_SECS;
 
 /// Name of the TOML section.
 pub const SECTION: &str = "aws_sqs";
+/// Metrics label for a queue URL with no alias.
+pub const UNCONFIGURED_LABEL: &str = "unconfigured";
 /// Prefix for environment overrides.
 pub const ENV_PREFIX: &str = "AUTUMN_AWS_SQS__";
 
 /// Plugin configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SqsConfig {
     /// AWS region. Unset: use the AWS default chain.
     pub region: Option<String>,
@@ -37,13 +40,12 @@ pub struct SqsConfig {
     pub jobs: JobsConfig,
     /// Worker settings.
     pub worker: WorkerConfig,
-    /// Health indicator settings.
-    pub health: HealthConfig,
 }
 
 /// Job transport settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct JobsConfig {
     /// Queue alias or URL for jobs whose queue has no alias.
     pub default_queue: String,
@@ -63,6 +65,7 @@ impl Default for JobsConfig {
 /// Worker settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct WorkerConfig {
     /// Long-poll wait, 0 to 20 s.
     pub wait_time_secs: u64,
@@ -97,14 +100,6 @@ impl Default for WorkerConfig {
     }
 }
 
-/// Health indicator settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct HealthConfig {
-    /// Include SQS in `/ready`. Default: `/health` only.
-    pub readiness: bool,
-}
-
 impl SqsConfig {
     /// Reads `[aws_sqs]` from the text of an `autumn.toml` file.
     ///
@@ -124,13 +119,41 @@ impl SqsConfig {
         profile: Option<&str>,
         env: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, SqsError> {
+        Self::from_layers(base, &[], profile, env)
+    }
+
+    /// Merges, in order: `[aws_sqs]` in `base`, `[profile.<name>.aws_sqs]` in
+    /// `base` for each of `profile_names`, `[aws_sqs]` in `profile_file`, and
+    /// env vars. Then validates.
+    fn from_layers(
+        base: Option<&str>,
+        profile_names: &[String],
+        profile_file: Option<&str>,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, SqsError> {
+        let parse = |text: &str| -> Result<toml::Table, SqsError> {
+            toml::from_str(text).map_err(|e| SqsError::Config(format!("toml: {e}")))
+        };
         let mut table = toml::Table::new();
-        for text in [base, profile].into_iter().flatten() {
-            let file: toml::Table =
-                toml::from_str(text).map_err(|e| SqsError::Config(format!("toml: {e}")))?;
+        if let Some(text) = base {
+            let file = parse(text)?;
             if let Some(toml::Value::Table(section)) = file.get(SECTION) {
                 merge(&mut table, section.clone());
             }
+            for name in profile_names {
+                if let Some(toml::Value::Table(section)) = file
+                    .get("profile")
+                    .and_then(|p| p.get(name))
+                    .and_then(|p| p.get(SECTION))
+                {
+                    merge(&mut table, section.clone());
+                }
+            }
+        }
+        if let Some(text) = profile_file
+            && let Some(toml::Value::Table(section)) = parse(text)?.get(SECTION)
+        {
+            merge(&mut table, section.clone());
         }
         let schema =
             toml::Table::try_from(Self::default()).map_err(|e| SqsError::Config(e.to_string()))?;
@@ -150,44 +173,64 @@ impl SqsConfig {
         Ok(cfg)
     }
 
-    /// Loads config from files in `dir` and from `env`.
+    /// Loads config from files and from `env`.
     ///
-    /// Reads `autumn.toml` and the first `autumn-<name>.toml` that exists for
-    /// `profile_names`.
+    /// For each file, it reads `manifest_dir/<file>` when that file exists,
+    /// else `./<file>`. It reads `autumn.toml`, the inline profile sections,
+    /// and the first `autumn-<name>.toml` that exists for `profile_names`.
     ///
     /// # Errors
     /// Returns [`SqsError::Config`] for a file that cannot be read or parsed.
     pub fn load_from_dir(
-        dir: &Path,
+        manifest_dir: &Path,
         profile_names: &[String],
         env: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, SqsError> {
-        let base = read_optional(&dir.join("autumn.toml"))?;
+        let find = |file: &str| {
+            let candidate = manifest_dir.join(file);
+            if candidate.exists() {
+                candidate
+            } else {
+                PathBuf::from(file)
+            }
+        };
+        let base = read_optional(&find("autumn.toml"))?;
         let mut profile = None;
         for name in profile_names {
-            if let Some(text) = read_optional(&dir.join(format!("autumn-{name}.toml")))? {
+            if let Some(text) = read_optional(&find(&format!("autumn-{name}.toml")))? {
                 profile = Some(text);
                 break;
             }
         }
-        Self::from_sources(base.as_deref(), profile.as_deref(), env)
+        Self::from_layers(base.as_deref(), profile_names, profile.as_deref(), env)
     }
 
-    /// Loads config like autumn-web does: `$AUTUMN_MANIFEST_DIR` first, then
-    /// the current directory, then the process environment.
+    /// Loads config like autumn-web does.
+    ///
+    /// - Files: `$AUTUMN_MANIFEST_DIR` (or the crate dir that
+    ///   `#[autumn_web::main]` records), then the current directory.
+    /// - Profile: `profile` (the app profile). The raw `AUTUMN_ENV` or
+    ///   `AUTUMN_PROFILE` value picks the file spelling, like autumn-web.
+    /// - Env: `.env` values, then the process environment.
     ///
     /// # Errors
     /// Returns [`SqsError::Config`] when loading or validation fails.
     pub fn load(profile: Option<&str>) -> Result<Self, SqsError> {
+        use autumn_web::config::Env as _;
+        let os = autumn_web::config::OsEnv;
         let names = profile
-            .map(|p| autumn_web::config::profile_override_file_lookup_names(p, p))
+            .map(|p| {
+                let selector = ["AUTUMN_ENV", "AUTUMN_PROFILE"]
+                    .iter()
+                    .find_map(|k| os.var(k).ok().filter(|v| !v.trim().is_empty()))
+                    .map_or_else(|| p.to_owned(), |v| v.trim().to_owned());
+                autumn_web::config::profile_override_file_lookup_names(p, &selector)
+            })
             .unwrap_or_default();
-        let dir = std::env::var("AUTUMN_MANIFEST_DIR")
-            .ok()
-            .map(PathBuf::from)
-            .filter(|d| d.join("autumn.toml").exists())
-            .unwrap_or_else(|| PathBuf::from("."));
-        Self::load_from_dir(&dir, &names, std::env::vars())
+        let dir = os
+            .var("AUTUMN_MANIFEST_DIR")
+            .map_or_else(|_| PathBuf::from("."), PathBuf::from);
+        Self::load_from_dir(&dir, &names, process_env())
     }
 
     /// Checks the values.
@@ -261,6 +304,21 @@ impl SqsConfig {
             .ok_or_else(|| SqsError::UnknownQueue(alias_or_url.to_owned()))
     }
 
+    /// Returns the metrics label for a queue: its alias, or `"unconfigured"`.
+    ///
+    /// A raw URL never becomes a label. This keeps the label set small and
+    /// keeps account IDs out of `/actuator/prometheus`.
+    #[must_use]
+    pub fn label_for(&self, alias_or_url: &str) -> String {
+        if self.queues.contains_key(alias_or_url) {
+            return alias_or_url.to_owned();
+        }
+        self.queues
+            .iter()
+            .find(|(_, url)| url.as_str() == alias_or_url)
+            .map_or_else(|| UNCONFIGURED_LABEL.to_owned(), |(alias, _)| alias.clone())
+    }
+
     /// Reads the static credentials from the named env vars.
     ///
     /// Returns `None` when no env var names are set: use the AWS default chain.
@@ -287,6 +345,26 @@ impl SqsConfig {
         };
         Ok(Some((read(key_var)?, read(secret_var)?)))
     }
+}
+
+/// Returns `.env` values, then the process environment (later wins).
+pub(crate) fn process_env() -> Vec<(String, String)> {
+    let mut vars = autumn_web::dotenv::resolve_process_dotenv().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "aws_sqs: .env is not valid; it is not used");
+        Vec::new()
+    });
+    vars.extend(std::env::vars());
+    vars
+}
+
+/// Reads one variable from the process environment, else from `.env`.
+pub(crate) fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().or_else(|| {
+        autumn_web::dotenv::resolve_process_dotenv()
+            .ok()?
+            .into_iter()
+            .find_map(|(k, v)| (k == name).then_some(v))
+    })
 }
 
 /// Returns `true` for an `http://` or `https://` URL.
@@ -422,7 +500,6 @@ mod tests {
                 ("AUTUMN_AWS_SQS__QUEUES__CRITICAL", URL),
                 ("AUTUMN_AWS_SQS__WORKER__MAX_IN_FLIGHT", "2"),
                 ("AUTUMN_AWS_SQS__WORKER__HEARTBEAT", "false"),
-                ("AUTUMN_AWS_SQS__HEALTH__READINESS", "true"),
                 ("UNRELATED", "x"),
             ]),
         )
@@ -431,7 +508,6 @@ mod tests {
         assert_eq!(cfg.queues["critical"], URL);
         assert_eq!(cfg.worker.max_in_flight, 2);
         assert!(!cfg.worker.heartbeat);
-        assert!(cfg.health.readiness);
     }
 
     #[test]
@@ -568,6 +644,28 @@ mod tests {
             .credentials(|k| (k == "MY_KEY").then(|| "AKIA-VISIBLE".to_owned()))
             .unwrap_err();
         assert!(!err.to_string().contains("AKIA-VISIBLE"));
+    }
+
+    #[test]
+    fn inline_profile_section_is_merged() {
+        let base = format!(
+            "[aws_sqs]\nregion = \"us-east-1\"\n[aws_sqs.queues]\ndefault = \"{URL}\"\n\
+             [profile.prod.aws_sqs]\nregion = \"eu-west-1\"\n"
+        );
+        let cfg =
+            SqsConfig::from_layers(Some(&base), &["prod".to_owned()], None, env(&[])).unwrap();
+        assert_eq!(cfg.region.as_deref(), Some("eu-west-1"));
+        let dev = SqsConfig::from_layers(Some(&base), &["dev".to_owned()], None, env(&[])).unwrap();
+        assert_eq!(dev.region.as_deref(), Some("us-east-1"));
+    }
+
+    #[test]
+    fn label_for_uses_alias_only() {
+        let mut cfg = SqsConfig::default();
+        cfg.queues.insert("jobs".into(), URL.into());
+        assert_eq!(cfg.label_for("jobs"), "jobs");
+        assert_eq!(cfg.label_for(URL), "jobs");
+        assert_eq!(cfg.label_for("https://other"), UNCONFIGURED_LABEL);
     }
 
     #[test]

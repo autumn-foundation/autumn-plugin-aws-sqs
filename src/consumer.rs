@@ -16,6 +16,7 @@ use crate::worker::{Dispatch, Outcome, RetryRule};
 
 /// Handler failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ConsumerError {
     /// Try again later under the consumer retry rule.
     #[error("retry: {0}")]
@@ -49,10 +50,10 @@ impl From<SqsError> for ConsumerError {
     }
 }
 
-/// Bad data does not get better on retry.
+/// Bad data does not get better on retry. The text has no input values.
 impl From<serde_json::Error> for ConsumerError {
     fn from(err: serde_json::Error) -> Self {
-        Self::Reject(format!("json: {err}"))
+        Self::Reject(format!("json: {}", crate::error::json_error_text(&err)))
     }
 }
 
@@ -120,8 +121,12 @@ impl SqsMessage {
     /// # Errors
     /// Returns [`ConsumerError::Reject`] when the body is not one.
     pub fn sns(&self) -> Result<SnsNotification, ConsumerError> {
-        serde_json::from_str(&self.body)
-            .map_err(|e| ConsumerError::reject(format!("not an SNS notification: {e}")))
+        serde_json::from_str(&self.body).map_err(|e| {
+            ConsumerError::reject(format!(
+                "not an SNS notification: {}",
+                crate::error::json_error_text(&e)
+            ))
+        })
     }
 
     /// Decodes the SNS `Message` field as JSON.
@@ -207,6 +212,10 @@ impl SqsConsumer {
 }
 
 impl Dispatch for SqsConsumer {
+    fn rule(&self, _message: &ReceivedMessage) -> RetryRule {
+        self.rule
+    }
+
     fn dispatch(&self, state: AppState, message: ReceivedMessage) -> BoxFuture<'static, Outcome> {
         let msg = SqsMessage {
             attempt: attempt_from_receive_count(message.receive_count),
@@ -237,8 +246,10 @@ mod tests {
         assert!(matches!(e, ConsumerError::Retry(_)));
         let e: ConsumerError = SqsError::NotStarted.into();
         assert!(matches!(e, ConsumerError::Retry(_)));
-        let bad = serde_json::from_str::<u8>("x").unwrap_err();
-        assert!(matches!(ConsumerError::from(bad), ConsumerError::Reject(_)));
+        let bad = serde_json::from_str::<u8>(r#""pii@example.com""#).unwrap_err();
+        let e = ConsumerError::from(bad);
+        assert!(matches!(e, ConsumerError::Reject(_)));
+        assert!(!e.to_string().contains("pii@example.com"), "{e}");
     }
 
     #[test]

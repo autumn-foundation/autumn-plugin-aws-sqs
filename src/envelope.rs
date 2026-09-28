@@ -18,6 +18,7 @@ pub const ATTR_DEAD_ATTEMPTS: &str = "autumn-attempts";
 
 /// Job message body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JobEnvelope {
     /// Format version. Always 1.
     pub v: u32,

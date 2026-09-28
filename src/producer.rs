@@ -8,10 +8,8 @@ use serde::Serialize;
 use crate::config::SqsConfig;
 use crate::error::SqsError;
 use crate::metrics::SqsMetrics;
-use crate::policy::{MAX_DELAY_SECS, batch_bounds, batch_count};
-use crate::transport::{
-    BatchEntryResult, MAX_MESSAGE_BYTES, OutboundMessage, SqsTransport, is_fifo,
-};
+use crate::policy::{MAX_BATCH_BYTES, batch_end};
+use crate::transport::{BatchEntryResult, OutboundMessage, SqsTransport, validate_outbound};
 
 /// Sends messages. Get it with [`SqsProducer::from_state`].
 ///
@@ -36,7 +34,7 @@ impl std::fmt::Debug for SqsProducer {
 impl SqsProducer {
     /// Makes a producer.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         transport: Arc<dyn SqsTransport>,
         config: SqsConfig,
         metrics: Arc<SqsMetrics>,
@@ -79,7 +77,8 @@ impl SqsProducer {
     /// Returns a validation error or the transport error.
     pub async fn send(&self, queue: &str, message: OutboundMessage) -> Result<String, SqsError> {
         let url = self.resolve(queue)?;
-        self.send_to_url(queue, &url, message).await
+        let label = self.inner.config.label_for(queue);
+        self.send_to_url(&label, &url, message).await
     }
 
     /// Sends `value` as a JSON body.
@@ -95,10 +94,10 @@ impl SqsProducer {
             .await
     }
 
-    /// Sends any number of messages in batches of 10.
+    /// Sends any number of messages in batches of 10 or less and 1 MiB or less.
     ///
     /// Returns one result per message, in input order. A failed batch call
-    /// fails each entry of that batch. Other batches still go.
+    /// fails each entry of that batch. The producer sends the other batches.
     ///
     /// # Errors
     /// Returns [`SqsError::UnknownQueue`] for an unknown alias.
@@ -110,41 +109,38 @@ impl SqsProducer {
         let url = self.resolve(queue)?;
         let n = messages.len();
         let mut results: Vec<Option<BatchEntryResult>> = (0..n).map(|_| None).collect();
-        let mut pending: Vec<Option<OutboundMessage>> = messages.into_iter().map(Some).collect();
-        for k in 0..batch_count(n) {
-            let Some((start, end)) = batch_bounds(n, k) else {
-                break;
-            };
-            // Check each entry first. Send only the valid ones.
-            let mut index = Vec::new();
-            let mut chunk = Vec::new();
-            for (i, slot) in pending.iter_mut().enumerate().take(end).skip(start) {
-                let Some(m) = slot.take() else {
-                    continue;
-                };
-                match check(&url, &m) {
-                    Ok(()) => {
-                        index.push(i);
-                        chunk.push(m);
-                    }
-                    Err(e) => results[i] = Some(Err(e)),
+        // Check each entry first. Batch only the valid ones.
+        let mut index = Vec::new();
+        let mut valid = Vec::new();
+        for (i, m) in messages.into_iter().enumerate() {
+            match validate_outbound(&url, &m) {
+                Ok(()) => {
+                    index.push(i);
+                    valid.push(m);
                 }
+                Err(e) => results[i] = Some(Err(e)),
             }
-            if chunk.is_empty() {
-                continue;
-            }
+        }
+        let sizes: Vec<usize> = valid.iter().map(OutboundMessage::size_bytes).collect();
+        let mut rest = valid.into_iter();
+        let mut start = 0;
+        while start < sizes.len() {
+            let end = batch_end(&sizes, start, MAX_BATCH_BYTES);
+            let chunk: Vec<OutboundMessage> = rest.by_ref().take(end - start).collect();
+            let slots = &index[start..end];
             match self.inner.transport.send_batch(&url, chunk).await {
                 Ok(out) => {
-                    for (i, r) in index.iter().zip(out) {
+                    for (i, r) in slots.iter().zip(out) {
                         results[*i] = Some(r);
                     }
                 }
                 Err(e) => {
-                    for i in &index {
+                    for i in slots {
                         results[*i] = Some(Err(e.clone()));
                     }
                 }
             }
+            start = end;
         }
         let results: Vec<BatchEntryResult> = results
             .into_iter()
@@ -152,21 +148,24 @@ impl SqsProducer {
             .collect();
         let ok = results.iter().filter(|r| r.is_ok()).count() as u64;
         let bad = results.len() as u64 - ok;
-        self.inner.metrics.update(queue, |c| {
-            c.sent += ok;
-            c.send_errors += bad;
-        });
+        self.inner
+            .metrics
+            .update(&self.inner.config.label_for(queue), |c| {
+                c.sent += ok;
+                c.send_errors += bad;
+            });
         Ok(results)
     }
 
-    /// Sends to a resolved URL. `label` names the queue in metrics.
+    /// Sends to a resolved URL. `label` names the queue in metrics. Use an
+    /// alias or a fixed name, never a raw URL: labels are kept forever.
     pub(crate) async fn send_to_url(
         &self,
         label: &str,
         url: &str,
         message: OutboundMessage,
     ) -> Result<String, SqsError> {
-        let result = match check(url, &message) {
+        let result = match validate_outbound(url, &message) {
             Ok(()) => self.inner.transport.send(url, message).await,
             Err(e) => Err(e),
         };
@@ -178,44 +177,31 @@ impl SqsProducer {
     }
 }
 
-/// Checks the SQS rules before a send.
-fn check(url: &str, m: &OutboundMessage) -> Result<(), SqsError> {
-    let size = m.size_bytes();
-    if size > MAX_MESSAGE_BYTES {
-        return Err(SqsError::TooLarge {
-            size,
-            max: MAX_MESSAGE_BYTES,
-        });
-    }
-    if is_fifo(url) && m.delay_secs > 0 {
-        return Err(SqsError::FifoDelay(url.to_owned()));
-    }
-    if m.delay_secs > MAX_DELAY_SECS {
-        return Err(SqsError::InvalidRequest(format!(
-            "delay {} s is over {MAX_DELAY_SECS} s",
-            m.delay_secs
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::MemoryTransport;
 
-    #[test]
-    fn check_rules() {
-        let url = "https://q/std";
-        assert!(check(url, &OutboundMessage::new("x")).is_ok());
-        assert!(matches!(
-            check(url, &OutboundMessage::new("x").delay_secs(901)),
-            Err(SqsError::InvalidRequest(_))
-        ));
-        assert!(matches!(
-            check("https://q/f.fifo", &OutboundMessage::new("x").delay_secs(1)),
-            Err(SqsError::FifoDelay(_))
-        ));
-        let big = OutboundMessage::new("x").attribute("k", "v".repeat(MAX_MESSAGE_BYTES));
-        assert!(matches!(check(url, &big), Err(SqsError::TooLarge { .. })));
+    fn producer() -> SqsProducer {
+        let mut cfg = SqsConfig::default();
+        cfg.queues
+            .insert("events".into(), "https://q/events".into());
+        let t = MemoryTransport::new().with_queue("https://q/events");
+        SqsProducer::new(Arc::new(t), cfg, Arc::new(SqsMetrics::new()))
+    }
+
+    #[tokio::test]
+    async fn metric_label_is_alias_or_unconfigured() {
+        let p = producer();
+        p.send("events", OutboundMessage::new("a")).await.unwrap();
+        p.send("https://q/events", OutboundMessage::new("b"))
+            .await
+            .unwrap();
+        let _ = p.send("https://q/other-1", OutboundMessage::new("c")).await;
+        let _ = p.send("https://q/other-2", OutboundMessage::new("d")).await;
+        let snap = p.inner.metrics.snapshot();
+        assert_eq!(snap["events"].sent, 2);
+        assert_eq!(snap["unconfigured"].send_errors, 2);
+        assert_eq!(snap.len(), 2, "no label per raw URL");
     }
 }

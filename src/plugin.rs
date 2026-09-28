@@ -35,7 +35,7 @@ const PROBE_POLL: Duration = Duration::from_millis(250);
 /// ```rust,ignore
 /// autumn_web::app()
 ///     .plugin(
-///         AwsSqsPlugin::from_autumn_toml()
+///         AwsSqsPlugin::new()
 ///             .jobs(jobs![send_welcome_email])
 ///             .consumer(SqsConsumer::new("uploads", "uploads", on_upload)),
 ///     )
@@ -64,12 +64,19 @@ impl std::fmt::Debug for AwsSqsPlugin {
     }
 }
 
+impl Default for AwsSqsPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AwsSqsPlugin {
-    /// Makes the plugin with this config.
+    /// Makes the plugin. It reads `[aws_sqs]` from `autumn.toml` at startup,
+    /// with the app profile, `.env`, and `AUTUMN_AWS_SQS__*` env vars.
     #[must_use]
-    pub fn new(config: SqsConfig) -> Self {
+    pub const fn new() -> Self {
         Self {
-            config: Some(config),
+            config: None,
             readiness: None,
             jobs: Vec::new(),
             consumers: Vec::new(),
@@ -78,12 +85,12 @@ impl AwsSqsPlugin {
         }
     }
 
-    /// Makes the plugin. It reads `[aws_sqs]` at startup, with the app profile.
+    /// Makes the plugin with this config. It reads no files.
     #[must_use]
-    pub fn from_autumn_toml() -> Self {
+    pub fn with_config(config: SqsConfig) -> Self {
         Self {
-            config: None,
-            ..Self::new(SqsConfig::default())
+            config: Some(config),
+            ..Self::new()
         }
     }
 
@@ -121,8 +128,10 @@ impl AwsSqsPlugin {
         self
     }
 
-    /// Puts the health indicator in `/ready`. Default: from the config, else
-    /// `/health` only.
+    /// Puts the health indicator in `/ready` too. Default: `/health` only.
+    ///
+    /// autumn reads this when the app builds, before the config loads. So it
+    /// is a builder setting, not a config key.
     #[must_use]
     pub const fn readiness(mut self, on: bool) -> Self {
         self.readiness = Some(on);
@@ -130,9 +139,7 @@ impl AwsSqsPlugin {
     }
 
     fn readiness_flag(&self) -> bool {
-        self.readiness
-            .or_else(|| self.config.as_ref().map(|c| c.health.readiness))
-            .unwrap_or(false)
+        self.readiness.unwrap_or(false)
     }
 
     /// Starts the plugin outside an app build, with the role of `state`.
@@ -177,8 +184,12 @@ impl AwsSqsPlugin {
     ) -> Result<SqsRuntime, SqsError> {
         let config = match self.config {
             Some(c) => c,
-            None => SqsConfig::load(state.config().profile.as_deref())?,
+            // autumn sets the state profile from the config; "default" means none.
+            None => SqsConfig::load(Some(state.profile()).filter(|p| *p != "default"))?,
         };
+        let interceptor = state
+            .extension::<Arc<dyn autumn_web::interceptor::JobInterceptor>>()
+            .map(|i| Arc::clone(&*i));
         config.validate()?;
         let transport: Arc<dyn SqsTransport> = match self.transport {
             Some(t) => t,
@@ -221,12 +232,14 @@ impl AwsSqsPlugin {
             routes,
             producer: producer.clone(),
             clock,
+            interceptor,
+            default_rule: RetryRule {
+                max_attempts: app_jobs.max_attempts.max(1),
+                initial_backoff_ms: app_jobs.initial_backoff_ms,
+            },
         });
         let mut specs: Vec<WorkerSpec> = Vec::new();
         let mut by_url: BTreeMap<String, String> = BTreeMap::new();
-        let dispatcher = Arc::new(JobDispatcher {
-            shared: Arc::clone(&shared),
-        });
         let mut job_urls: BTreeMap<String, String> = BTreeMap::new();
         for route in shared.routes.values() {
             job_urls
@@ -238,8 +251,11 @@ impl AwsSqsPlugin {
             by_url.insert(url.clone(), format!("jobs ({label})"));
             specs.push(WorkerSpec {
                 label,
-                queue_url: url,
-                dispatch: dispatcher.clone(),
+                queue_url: url.clone(),
+                dispatch: Arc::new(JobDispatcher {
+                    shared: Arc::clone(&shared),
+                    queue_url: url,
+                }),
                 dead_letter_url: dead_letter_url.clone(),
             });
         }
@@ -298,6 +314,9 @@ impl AwsSqsPlugin {
         }
         let workers = if role.runs_workers() { specs.len() } else { 0 };
         if role.runs_workers() {
+            if dead_letter_url.is_none() {
+                warn_without_dead_letter_path(transport.as_ref(), &specs).await;
+            }
             let ctx = WorkerCtx {
                 transport,
                 config: config.worker.clone(),
@@ -346,10 +365,16 @@ fn job_route(
                 queue = %info.queue,
                 "aws_sqs: no queue alias for this job queue; using the default queue"
             );
-            (default_label.to_owned(), default_url.to_owned())
+            (config.label_for(default_label), default_url.to_owned())
         },
-        |url| (info.queue.clone(), url),
+        |url| (config.label_for(&info.queue), url),
     );
+    if info.uniqueness.is_some() || info.concurrency.is_some() {
+        tracing::warn!(
+            job = %info.name,
+            "aws_sqs does not apply #[job(unique)] or #[job(concurrency)]; use a FIFO dedup_id"
+        );
+    }
     // Zero means "not set" in `#[job]`: use the app `[jobs]` defaults.
     let rule = RetryRule {
         max_attempts: if info.max_attempts == 0 {
@@ -368,6 +393,22 @@ fn job_route(
         url,
         label,
         rule,
+    }
+}
+
+/// Warns for each worker queue that has no SQS redrive policy. With no DLQ
+/// either, a failed message stays in the queue until its retention ends.
+async fn warn_without_dead_letter_path(transport: &dyn SqsTransport, specs: &[WorkerSpec]) {
+    for spec in specs {
+        if let Ok(stats) = transport.queue_stats(&spec.queue_url).await
+            && stats.redrive_target.is_none()
+        {
+            tracing::warn!(
+                queue = %spec.label,
+                "aws_sqs: no dead_letter_queue and no redrive policy; failed messages stay \
+                 until the queue retention ends"
+            );
+        }
     }
 }
 
@@ -449,6 +490,12 @@ impl SqsRuntime {
     #[must_use]
     pub fn workers_running(&self) -> usize {
         self.running.load(Ordering::SeqCst)
+    }
+
+    /// Returns the live worker count, for checks after [`Self::shutdown`].
+    #[must_use]
+    pub fn running_handle(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.running)
     }
 
     /// Stops receive, waits for in-flight handlers, and stops all tasks.

@@ -15,7 +15,7 @@ pub enum SqsError {
     /// No queue URL is set for this alias.
     #[error("unknown queue alias: {0}")]
     UnknownQueue(String),
-    /// No `#[job]` with this name is registered with the plugin.
+    /// The plugin has no `#[job]` with this name.
     #[error("unknown job: {0}")]
     UnknownJob(String),
     /// SQS rejected the request as not valid.
@@ -41,10 +41,37 @@ pub enum SqsError {
     /// The plugin runtime did not start.
     #[error("aws_sqs runtime is not started")]
     NotStarted,
+    /// A `JobInterceptor` stopped or failed the enqueue.
+    #[error("job interceptor: {0}")]
+    Intercepted(String),
 }
 
 impl From<serde_json::Error> for SqsError {
     fn from(err: serde_json::Error) -> Self {
-        Self::Json(err.to_string())
+        Self::Json(json_error_text(&err))
+    }
+}
+
+/// Describes a JSON error without the input values. Message data stays out
+/// of logs and dead-letter reasons.
+pub(crate) fn json_error_text(err: &serde_json::Error) -> String {
+    format!(
+        "{:?} error at line {} column {}",
+        err.classify(),
+        err.line(),
+        err.column()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_error_hides_values() {
+        let err = serde_json::from_str::<u8>(r#""secret-value""#).unwrap_err();
+        let e = SqsError::from(err);
+        assert!(!e.to_string().contains("secret-value"), "{e}");
+        assert!(e.to_string().contains("line 1"));
     }
 }

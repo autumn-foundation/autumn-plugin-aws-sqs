@@ -77,58 +77,52 @@ type Pick = fn(&QueueCounters) -> u64;
 
 const COUNTERS: &[(&str, &str, Pick)] = &[
     (
-        "autumn_sqs_messages_received_total",
+        "aws_sqs_messages_received_total",
         "Messages received.",
         |c| c.received,
     ),
     (
-        "autumn_sqs_messages_succeeded_total",
+        "aws_sqs_messages_succeeded_total",
         "Messages handled and deleted.",
         |c| c.succeeded,
     ),
     (
-        "autumn_sqs_messages_retried_total",
+        "aws_sqs_messages_retried_total",
         "Failures with a retry scheduled.",
         |c| c.retried,
     ),
     (
-        "autumn_sqs_messages_dead_lettered_total",
+        "aws_sqs_messages_dead_lettered_total",
         "Messages sent to the dead-letter queue.",
         |c| c.dead_lettered,
     ),
     (
-        "autumn_sqs_messages_poisoned_total",
+        "aws_sqs_messages_poisoned_total",
         "Messages that failed with no retry.",
         |c| c.poisoned,
     ),
     (
-        "autumn_sqs_messages_redrive_deferred_total",
+        "aws_sqs_messages_redrive_deferred_total",
         "Dead letters left for the SQS redrive policy.",
         |c| c.redrive_deferred,
     ),
     (
-        "autumn_sqs_delay_hops_total",
+        "aws_sqs_delay_hops_total",
         "Delay hops for long delays.",
         |c| c.hops,
     ),
-    (
-        "autumn_sqs_heartbeats_total",
-        "Visibility extensions.",
-        |c| c.heartbeats,
-    ),
-    ("autumn_sqs_messages_sent_total", "Messages sent.", |c| {
-        c.sent
+    ("aws_sqs_heartbeats_total", "Visibility extensions.", |c| {
+        c.heartbeats
     }),
-    ("autumn_sqs_send_errors_total", "Send failures.", |c| {
+    ("aws_sqs_messages_sent_total", "Messages sent.", |c| c.sent),
+    ("aws_sqs_send_errors_total", "Send failures.", |c| {
         c.send_errors
     }),
+    ("aws_sqs_receive_errors_total", "Receive failures.", |c| {
+        c.receive_errors
+    }),
     (
-        "autumn_sqs_receive_errors_total",
-        "Receive failures.",
-        |c| c.receive_errors,
-    ),
-    (
-        "autumn_sqs_ack_errors_total",
+        "aws_sqs_ack_errors_total",
         "Delete or visibility failures.",
         |c| c.ack_errors,
     ),
@@ -162,7 +156,7 @@ impl MetricsSource for SqsMetrics {
             })
             .collect();
         families.push(MetricFamily {
-            name: "autumn_sqs_handlers_in_flight".to_owned(),
+            name: "aws_sqs_handlers_in_flight".to_owned(),
             help: "Handlers that run now.".to_owned(),
             kind: MetricKind::Gauge,
             samples: snap
@@ -191,7 +185,7 @@ impl MetricsSource for SqsMetrics {
             }
         }
         families.push(MetricFamily {
-            name: "autumn_sqs_queue_messages".to_owned(),
+            name: "aws_sqs_queue_messages".to_owned(),
             help: "Approximate messages in the queue, by state.".to_owned(),
             kind: MetricKind::Gauge,
             samples: depth,
@@ -226,12 +220,12 @@ mod tests {
         let f = m.collect();
         let received = f
             .iter()
-            .find(|f| f.name == "autumn_sqs_messages_received_total")
+            .find(|f| f.name == "aws_sqs_messages_received_total")
             .unwrap();
         assert!((received.samples[0].value - 5.0).abs() < f64::EPSILON);
         let depth = f
             .iter()
-            .find(|f| f.name == "autumn_sqs_queue_messages")
+            .find(|f| f.name == "aws_sqs_queue_messages")
             .unwrap();
         assert_eq!(depth.samples.len(), 3);
         let names: std::collections::HashSet<_> = f.iter().map(|f| f.name.clone()).collect();

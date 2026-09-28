@@ -52,14 +52,14 @@ Selected scope: items 1 to 6.
 | FIFO send without a group ID fails. | Default group ID is the job name. |
 | Per-message delay on FIFO fails. | Return a typed error. |
 | Leak credentials. | Read keys from named env vars only. Never log them. |
-| Partial credential config. | Reject at build time. |
+| Partial credential config. | Reject at app startup. |
 | Tests need AWS. | `SqsTransport` trait with an in-memory fake. LocalStack for integration tests. |
 
 ## 5. Six thinking hats
 
 - **White (facts):** SQS is at-least-once. Standard queues do not keep order. `DelaySeconds` max is 900. Visibility max is 43 200 s. Batch max is 10. FIFO has no per-message delay. Message size max is 1 MiB.
 - **Red (feelings):** Users want `#[job]` to "just work" on SQS. A new enqueue call feels less clean than `XJob::enqueue`.
-- **Black (risks):** A `JobInterceptor` route loses the due time. Delayed jobs would run at once. It also takes the single interceptor slot. We reject it.
+- **Black (risks):** A `JobInterceptor` route loses the due time. A delayed job runs immediately. It also takes the single interceptor slot. We reject it.
   Tracked jobs, `unique`, and `concurrency` attributes do not map to SQS. We document this.
 - **Yellow (benefits):** Managed durability. No Redis or Postgres queue tables. Native DLQ. Scales to zero.
 - **Green (ideas):** Upstream `JobBackend` seam in autumn-web. Then `XJob::enqueue` routes to SQS. See ADR 0001.
@@ -94,7 +94,7 @@ Modules:
 - `jobs` — `SqsJobClient` and job dispatcher.
 - `consumer` — consumer handlers and `SqsMessage`.
 - `worker` — receive loop, heartbeat, drain.
-- `ops` — health indicator and metrics source.
+- `health`, `metrics` — health indicator and metrics source.
 - `plugin` — `AwsSqsPlugin`.
 
 ## 7. Acceptance criteria

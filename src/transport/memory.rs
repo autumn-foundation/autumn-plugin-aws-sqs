@@ -9,11 +9,11 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use super::{
-    BatchEntryResult, BoxFuture, MAX_MESSAGE_BYTES, OutboundMessage, QueueStats, ReceiveOptions,
-    ReceivedMessage, SqsTransport, is_fifo,
+    BatchEntryResult, BoxFuture, OutboundMessage, QueueStats, ReceiveOptions, ReceivedMessage,
+    SqsTransport, is_fifo, validate_outbound,
 };
 use crate::error::SqsError;
-use crate::policy::{MAX_BATCH, MAX_DELAY_SECS, MAX_VISIBILITY_SECS};
+use crate::policy::{MAX_BATCH, MAX_BATCH_BYTES, MAX_VISIBILITY_SECS};
 
 /// A copy of one stored message, for test assertions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +67,7 @@ struct Queue {
     messages: Vec<Stored>,
     redrive: Option<(String, u32)>,
     dedup: HashMap<String, (String, Instant)>,
+    content_dedup: bool,
 }
 
 struct Stored {
@@ -77,6 +78,8 @@ struct Stored {
     visible_at: Instant,
     receive_count: u32,
     receipt: Option<String>,
+    /// Time of the last receive. SQS allows 12 h of visibility from it.
+    received_at: Option<Instant>,
 }
 
 impl Stored {
@@ -91,35 +94,6 @@ impl Stored {
 
 /// FIFO deduplication window.
 const DEDUP_WINDOW: Duration = Duration::from_secs(300);
-
-fn validate(queue_url: &str, message: &OutboundMessage) -> Result<(), SqsError> {
-    let size = message.size_bytes();
-    if size > MAX_MESSAGE_BYTES {
-        return Err(SqsError::TooLarge {
-            size,
-            max: MAX_MESSAGE_BYTES,
-        });
-    }
-    if message.delay_secs > MAX_DELAY_SECS {
-        return Err(SqsError::InvalidRequest(format!(
-            "DelaySeconds {} is over {MAX_DELAY_SECS}",
-            message.delay_secs
-        )));
-    }
-    if is_fifo(queue_url) {
-        if message.group_id.is_none() {
-            return Err(SqsError::InvalidRequest(
-                "FIFO queue needs MessageGroupId".to_owned(),
-            ));
-        }
-        if message.delay_secs > 0 {
-            return Err(SqsError::InvalidRequest(
-                "FIFO queue does not accept per-message DelaySeconds".to_owned(),
-            ));
-        }
-    }
-    Ok(())
-}
 
 fn check_visibility(secs: u64) -> Result<(), SqsError> {
     if secs > MAX_VISIBILITY_SECS {
@@ -149,8 +123,22 @@ impl MemoryTransport {
         self.lock().queues.entry(queue_url.to_owned()).or_default();
     }
 
+    /// Turns on content-based deduplication for a FIFO queue.
+    #[must_use]
+    pub fn with_content_dedup(self, queue_url: &str) -> Self {
+        self.lock()
+            .queues
+            .entry(queue_url.to_owned())
+            .or_default()
+            .content_dedup = true;
+        self
+    }
+
     /// Sets a redrive policy: after `max_receive_count` receives, the next
     /// receive moves the message to `dead_letter_url`.
+    ///
+    /// # Panics
+    /// Panics when one queue is FIFO and the other is not. SQS rejects that.
     #[must_use]
     pub fn with_redrive(
         self,
@@ -158,6 +146,10 @@ impl MemoryTransport {
         dead_letter_url: &str,
         max_receive_count: u32,
     ) -> Self {
+        assert!(
+            is_fifo(queue_url) == is_fifo(dead_letter_url),
+            "the source queue and the dead-letter queue must be the same type (FIFO or standard)"
+        );
         self.lock()
             .queues
             .entry(queue_url.to_owned())
@@ -198,16 +190,22 @@ impl MemoryTransport {
     }
 
     fn send_now(&self, queue_url: &str, message: OutboundMessage) -> Result<String, SqsError> {
-        validate(queue_url, &message)?;
+        validate_outbound(queue_url, &message)?;
         let now = Instant::now();
         let mut state = self.lock();
         let n = state.next();
         let queue = state.queue(queue_url)?;
         if is_fifo(queue_url) {
-            let key = message
-                .dedup_id
-                .clone()
-                .unwrap_or_else(|| format!("body:{}", message.body));
+            let key = match (&message.dedup_id, queue.content_dedup) {
+                (Some(id), _) => id.clone(),
+                (None, true) => format!("body:{}", message.body),
+                (None, false) => {
+                    return Err(SqsError::InvalidRequest(
+                        "FIFO queue needs MessageDeduplicationId or content-based deduplication"
+                            .to_owned(),
+                    ));
+                }
+            };
             queue
                 .dedup
                 .retain(|_, (_, at)| now.duration_since(*at) < DEDUP_WINDOW);
@@ -225,6 +223,7 @@ impl MemoryTransport {
             visible_at: now + Duration::from_secs(message.delay_secs),
             receive_count: 0,
             receipt: None,
+            received_at: None,
         });
         drop(state);
         self.notify.notify_waiters();
@@ -242,10 +241,13 @@ impl MemoryTransport {
         let fifo = is_fifo(queue_url);
         let redrive = state.queue(queue_url)?.redrive.clone();
 
-        // Move messages over the redrive limit first.
-        let mut dead = Vec::new();
-        if let Some((dlq, max)) = &redrive {
+        // Move messages over the redrive limit first. A missing DLQ moves nothing.
+        let mut moved = false;
+        if let Some((dlq, max)) = &redrive
+            && state.queues.contains_key(dlq)
+        {
             let queue = state.queue(queue_url)?;
+            let mut dead = Vec::new();
             let mut i = 0;
             while i < queue.messages.len() {
                 let m = &queue.messages[i];
@@ -255,14 +257,14 @@ impl MemoryTransport {
                     i += 1;
                 }
             }
-            if !dead.is_empty() {
-                let target = state.queue(dlq)?;
-                for mut m in dead {
-                    m.receive_count = 0;
-                    m.receipt = None;
-                    m.visible_at = now;
-                    target.messages.push(m);
-                }
+            moved = !dead.is_empty();
+            let target = state.queue(dlq)?;
+            for mut m in dead {
+                m.receive_count = 0;
+                m.receipt = None;
+                m.received_at = None;
+                m.visible_at = now;
+                target.messages.push(m);
             }
         }
 
@@ -271,16 +273,9 @@ impl MemoryTransport {
             receipts.push(state.next());
         }
         let queue = state.queue(queue_url)?;
-        let mut blocked: Vec<String> = if fifo {
-            queue
-                .messages
-                .iter()
-                .filter(|m| m.in_flight(now))
-                .filter_map(|m| m.group_id.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // FIFO: a group with a message that is not visible gives nothing after
+        // that message. Several visible messages of one group come in order.
+        let mut blocked: Vec<String> = Vec::new();
         let mut out = Vec::new();
         let mut next_wake: Option<Instant> = None;
         let mut receipts = receipts.into_iter();
@@ -288,54 +283,70 @@ impl MemoryTransport {
             if out.len() >= options.max_messages as usize {
                 break;
             }
-            if m.visible_at > now {
-                next_wake = Some(next_wake.map_or(m.visible_at, |w| w.min(m.visible_at)));
-                continue;
-            }
-            if let Some(g) = &m.group_id
+            let group = m.group_id.clone().filter(|_| fifo);
+            if let Some(g) = &group
                 && blocked.contains(g)
             {
+                continue;
+            }
+            if m.visible_at > now {
+                next_wake = Some(next_wake.map_or(m.visible_at, |w| w.min(m.visible_at)));
+                if let Some(g) = group {
+                    blocked.push(g);
+                }
                 continue;
             }
             let Some(n) = receipts.next() else { break };
             let receipt = format!("rh-{}-{n}", m.id);
             m.receive_count += 1;
             m.receipt = Some(receipt.clone());
+            m.received_at = Some(now);
             m.visible_at = now + Duration::from_secs(options.visibility_secs);
-            if let Some(g) = &m.group_id {
-                blocked.push(g.clone());
-            }
             out.push(ReceivedMessage {
                 message_id: m.id.clone(),
                 receipt_handle: receipt,
                 body: m.body.clone(),
                 receive_count: Some(m.receive_count),
                 attributes: m.attributes.clone(),
+                group_id: m.group_id.clone(),
             });
         }
         drop(state);
+        if moved {
+            self.notify.notify_waiters();
+        }
         Ok((out, next_wake))
     }
 
+    /// Runs `f` on the message with this current receipt handle.
+    ///
+    /// Returns `Ok(None)` for an old receipt handle of this fake, like SQS
+    /// accepts an old handle. Returns an error for a handle it never made.
     fn with_receipt<T>(
         &self,
         queue_url: &str,
         receipt_handle: &str,
         f: impl FnOnce(&mut Queue, usize, Instant) -> T,
-    ) -> Result<T, SqsError> {
+    ) -> Result<Option<T>, SqsError> {
         let now = Instant::now();
         let mut state = self.lock();
         let queue = state.queue(queue_url)?;
-        let idx = queue
+        let Some(idx) = queue
             .messages
             .iter()
             .position(|m| m.receipt.as_deref() == Some(receipt_handle))
-            .ok_or_else(|| {
-                SqsError::InvalidRequest(format!("receipt handle is not valid: {receipt_handle}"))
-            })?;
+        else {
+            if receipt_handle.starts_with("rh-") {
+                return Ok(None);
+            }
+            return Err(SqsError::InvalidRequest(format!(
+                "receipt handle is not valid: {receipt_handle}"
+            )));
+        };
         let out = f(queue, idx, now);
         drop(state);
-        Ok(out)
+        self.notify.notify_waiters();
+        Ok(Some(out))
     }
 }
 
@@ -361,6 +372,12 @@ impl SqsTransport for MemoryTransport {
                 )));
             }
             self.lock().queue(queue_url)?;
+            let total: usize = messages.iter().map(OutboundMessage::size_bytes).sum();
+            if total > MAX_BATCH_BYTES {
+                return Err(SqsError::InvalidRequest(format!(
+                    "BatchRequestTooLong: {total} bytes; the limit is {MAX_BATCH_BYTES}"
+                )));
+            }
             Ok(messages
                 .into_iter()
                 .map(|m| self.send_now(queue_url, m))
@@ -407,6 +424,7 @@ impl SqsTransport for MemoryTransport {
             self.with_receipt(queue_url, receipt_handle, |queue, idx, _| {
                 queue.messages.remove(idx);
             })
+            .map(|_| ())
         })
     }
 
@@ -425,9 +443,20 @@ impl SqsTransport for MemoryTransport {
                         "message is not in flight".to_owned(),
                     ));
                 }
+                // SQS allows 12 h of visibility from the receive.
+                let used = m
+                    .received_at
+                    .map_or(0, |at| now.duration_since(at).as_secs());
+                if used + visibility_secs > MAX_VISIBILITY_SECS {
+                    return Err(SqsError::InvalidRequest(format!(
+                        "VisibilityTimeout {visibility_secs} is over the time left ({} s)",
+                        MAX_VISIBILITY_SECS.saturating_sub(used)
+                    )));
+                }
                 m.visible_at = now + Duration::from_secs(visibility_secs);
                 Ok(())
             })?
+            .ok_or_else(|| SqsError::InvalidRequest("receipt handle is not current".to_owned()))?
         })
     }
 
@@ -521,8 +550,13 @@ mod tests {
         let first = t.receive(Q, opts(1)).await.unwrap();
         tokio::time::advance(Duration::from_secs(2)).await;
         let second = t.receive(Q, opts(30)).await.unwrap();
-        let stale = t.delete(Q, &first[0].receipt_handle).await;
-        assert!(matches!(stale, Err(SqsError::InvalidRequest(_))));
+        // Like SQS: an old receipt succeeds but does not delete.
+        t.delete(Q, &first[0].receipt_handle).await.unwrap();
+        assert_eq!(t.messages(Q).len(), 1);
+        assert!(matches!(
+            t.delete(Q, "junk").await,
+            Err(SqsError::InvalidRequest(_))
+        ));
         t.delete(Q, &second[0].receipt_handle).await.unwrap();
         assert!(t.messages(Q).is_empty());
     }
@@ -668,7 +702,20 @@ mod tests {
                     .delay_secs(5),
             )
             .await;
-        assert!(matches!(delayed, Err(SqsError::InvalidRequest(_))));
+        assert!(matches!(delayed, Err(SqsError::FifoDelay(_))));
+        let no_dedup = t.send(FIFO, OutboundMessage::new("a").group_id("g")).await;
+        assert!(matches!(no_dedup, Err(SqsError::InvalidRequest(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fifo_content_dedup_uses_body() {
+        let t = MemoryTransport::new()
+            .with_queue(FIFO)
+            .with_content_dedup(FIFO);
+        let m = || OutboundMessage::new("same").group_id("g");
+        let a = t.send(FIFO, m()).await.unwrap();
+        let b = t.send(FIFO, m()).await.unwrap();
+        assert_eq!(a, b);
     }
 
     #[tokio::test(start_paused = true)]
@@ -692,12 +739,113 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Like SQS: one receive can hold several messages of one group, in order.
         let got = t.receive(FIFO, opts(30)).await.unwrap();
         let bodies: Vec<_> = got.iter().map(|m| m.body.as_str()).collect();
-        assert_eq!(bodies, vec!["1", "3"]);
-        t.delete(FIFO, &got[0].receipt_handle).await.unwrap();
+        assert_eq!(bodies, vec!["1", "2", "3"]);
+        assert_eq!(got[0].group_id.as_deref(), Some("g1"));
+        // A group with a message in flight gives nothing more.
+        t.send(FIFO, OutboundMessage::new("4").group_id("g1").dedup_id("4"))
+            .await
+            .unwrap();
+        assert!(t.receive(FIFO, opts(30)).await.unwrap().is_empty());
+        // When the head comes back, the group comes back in order.
+        t.change_visibility(FIFO, &got[0].receipt_handle, 0)
+            .await
+            .unwrap();
+        t.delete(FIFO, &got[1].receipt_handle).await.unwrap();
+        t.delete(FIFO, &got[2].receipt_handle).await.unwrap();
         let next = t.receive(FIFO, opts(30)).await.unwrap();
-        assert_eq!(next[0].body, "2");
+        let bodies: Vec<_> = next.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, vec!["1", "4"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attribute_rules_follow_sqs() {
+        let t = MemoryTransport::new().with_queue(Q);
+        let mut m = OutboundMessage::new("x");
+        for i in 0..11 {
+            m = m.attribute(format!("a{i}"), "v");
+        }
+        assert!(matches!(
+            t.send(Q, m).await,
+            Err(SqsError::InvalidRequest(_))
+        ));
+        let empty = OutboundMessage::new("x").attribute("k", "");
+        assert!(matches!(
+            t.send(Q, empty).await,
+            Err(SqsError::InvalidRequest(_))
+        ));
+        let bad = OutboundMessage::new("bad \u{0} char");
+        assert!(matches!(
+            t.send(Q, bad).await,
+            Err(SqsError::InvalidRequest(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_over_one_mib_is_rejected() {
+        let t = MemoryTransport::new().with_queue(Q);
+        let big = || OutboundMessage::new("x".repeat(300_000));
+        let err = t.send_batch(Q, vec![big(), big(), big(), big()]).await;
+        assert!(
+            matches!(err, Err(SqsError::InvalidRequest(ref m)) if m.contains("BatchRequestTooLong"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn visibility_change_respects_twelve_hour_budget() {
+        let t = MemoryTransport::new().with_queue(Q);
+        t.send(Q, OutboundMessage::new("a")).await.unwrap();
+        let got = t.receive(Q, opts(43_200)).await.unwrap();
+        tokio::time::advance(Duration::from_secs(43_000)).await;
+        let over = t.change_visibility(Q, &got[0].receipt_handle, 300).await;
+        assert!(matches!(over, Err(SqsError::InvalidRequest(_))));
+        t.change_visibility(Q, &got[0].receipt_handle, 100)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_poll_wakes_on_visibility_change() {
+        let t = MemoryTransport::new().with_queue(Q);
+        t.send(Q, OutboundMessage::new("a")).await.unwrap();
+        let got = t.receive(Q, opts(300)).await.unwrap();
+        let t2 = t.clone();
+        let start = tokio::time::Instant::now();
+        let poll = tokio::spawn(async move {
+            t2.receive(
+                Q,
+                ReceiveOptions {
+                    max_messages: 1,
+                    wait_secs: 20,
+                    visibility_secs: 30,
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        t.change_visibility(Q, &got[0].receipt_handle, 0)
+            .await
+            .unwrap();
+        assert_eq!(poll.await.unwrap().unwrap().len(), 1);
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn redrive_to_missing_queue_keeps_message() {
+        let t = MemoryTransport::new().with_queue(Q).with_redrive(Q, DLQ, 1);
+        t.send(Q, OutboundMessage::new("a")).await.unwrap();
+        t.receive(Q, opts(1)).await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let _ = t.receive(Q, opts(1)).await;
+        assert_eq!(t.messages(Q).len(), 1, "no message is lost");
+    }
+
+    #[test]
+    #[should_panic(expected = "same type")]
+    fn redrive_type_must_match() {
+        let _ = MemoryTransport::new().with_redrive(FIFO, DLQ, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -723,16 +871,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn batch_reports_per_entry() {
         let t = MemoryTransport::new().with_queue(Q);
-        let big = "x".repeat(super::super::MAX_MESSAGE_BYTES + 1);
         let res = t
             .send_batch(
                 Q,
-                vec![OutboundMessage::new("a"), OutboundMessage::new(big)],
+                vec![OutboundMessage::new("a"), OutboundMessage::new("bad \u{0}")],
             )
             .await
             .unwrap();
         assert!(res[0].is_ok());
-        assert!(matches!(res[1], Err(SqsError::TooLarge { .. })));
+        assert!(matches!(res[1], Err(SqsError::InvalidRequest(_))));
         assert_eq!(t.messages(Q).len(), 1);
     }
 
