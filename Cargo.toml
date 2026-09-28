@@ -1,0 +1,40 @@
+[package]
+name = "autumn-plugin-aws-sqs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+description = "Amazon SQS plugin for autumn-web: job transport, queue consumers, and producer"
+license = "Apache-2.0"
+repository = "https://github.com/autumn-foundation/autumn-plugin-aws-sqs"
+readme = "README.md"
+keywords = ["autumn", "sqs", "aws", "jobs", "queue"]
+categories = ["web-programming", "asynchronous"]
+
+[dependencies]
+autumn-web = { version = "0.7.0", default-features = false }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+aws-sdk-sqs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+futures = "0.3"
+toml = "0.9"
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+# `pub(crate)` marks crate-internal items on purpose.
+redundant_pub_crate = "allow"
