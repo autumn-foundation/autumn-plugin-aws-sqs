@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Amazon SQS plugin for autumn-web 0.7. Style for all docs and comments: ASD-STE100.
+Amazon SQS plugin for autumn-web 0.8. Style for all docs and comments: ASD-STE100.
 
 ## Layout
 

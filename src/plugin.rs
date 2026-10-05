@@ -10,6 +10,7 @@ use autumn_web::actuator::{HealthIndicator, MetricsSource};
 use autumn_web::app::AppBuilder;
 use autumn_web::job::JobInfo;
 use autumn_web::plugin::Plugin;
+use autumn_web::plugin_contract::PluginContract;
 use autumn_web::reexports::tokio_util::sync::CancellationToken;
 use autumn_web::time::{ClockSource, SystemClock};
 use autumn_web::{AppState, AutumnError, ProcessRole};
@@ -530,6 +531,14 @@ impl SqsRuntime {
 impl Plugin for AwsSqsPlugin {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed(PLUGIN_NAME)
+    }
+
+    fn contract(&self) -> Option<PluginContract> {
+        Some(
+            PluginContract::new(env!("CARGO_PKG_NAME"))
+                .plugin_version(env!("CARGO_PKG_VERSION"))
+                .autumn_web("0.8"),
+        )
     }
 
     fn build(self, app: AppBuilder) -> AppBuilder {
