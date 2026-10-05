@@ -11,7 +11,7 @@ keywords = ["autumn", "sqs", "aws", "jobs", "queue"]
 categories = ["web-programming", "asynchronous"]
 
 [dependencies]
-autumn-web = { version = "0.7.0", default-features = false }
+autumn-web = { version = "0.8.0", default-features = false }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
 aws-sdk-sqs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }

@@ -1,6 +1,6 @@
 # autumn-plugin-aws-sqs
 
-Amazon SQS plugin for [autumn-web](https://crates.io/crates/autumn-web) 0.7.
+Amazon SQS plugin for [autumn-web](https://crates.io/crates/autumn-web) 0.8.
 
 - **Jobs.** Send `#[job]` work to SQS. Workers run the same handler.
 - **Consumers.** Run a handler for each message on a queue: S3 events, SNS fan-out, other services.
@@ -11,7 +11,7 @@ Amazon SQS plugin for [autumn-web](https://crates.io/crates/autumn-web) 0.7.
 
 ```toml
 [dependencies]
-autumn-web = "0.7"
+autumn-web = "0.8"
 autumn-plugin-aws-sqs = "0.1"
 ```
 
@@ -166,7 +166,7 @@ let results = producer.send_batch("events", messages).await?; // one result per 
 - A `web` replica sends jobs and runs no workers.
 - When the app drains (`/ready` is 503), the workers stop the receive calls. They wait up to `worker.drain_timeout_secs` for handlers that run.
 
-**Split roles need a `[jobs]` backend value.** autumn-web 0.7 stops a `web` or `worker` process at boot when `[jobs] backend` is `local`. It does this even when the app has no autumn jobs. Set a durable backend name. Register no jobs with `AppBuilder::jobs` and no durable event listeners. autumn then starts no job backend.
+**Split roles need a `[jobs]` backend value.** autumn-web 0.8 stops a `web` or `worker` process at boot when `[jobs] backend` is `local`. It does this even when the app has no autumn jobs. Set a durable backend name. Register no jobs with `AppBuilder::jobs` and no durable event listeners. autumn then starts no job backend.
 
 ```toml
 [jobs]

@@ -503,3 +503,16 @@ async fn custom_transport_arc_is_accepted() {
     SqsProducer::from_state(&state).unwrap();
     rt.shutdown().await;
 }
+
+#[test]
+fn plugin_declares_autumn_contract() {
+    use autumn_web::plugin::Plugin;
+    let p = AwsSqsPlugin::with_config(config()).with_transport(MemoryTransport::new());
+    let contract = p.contract().expect("plugin declares a contract");
+    assert_eq!(contract.plugin, "autumn-plugin-aws-sqs");
+    assert_eq!(
+        contract.plugin_version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(contract.autumn_web.as_deref(), Some("0.8"));
+}
