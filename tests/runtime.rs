@@ -514,5 +514,5 @@ fn plugin_declares_autumn_contract() {
         contract.plugin_version.as_deref(),
         Some(env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(contract.autumn_web.as_deref(), Some("0.8"));
+    assert_eq!(contract.autumn_web.as_deref(), Some("0.9"));
 }

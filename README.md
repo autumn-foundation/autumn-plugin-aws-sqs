@@ -1,6 +1,6 @@
 # autumn-plugin-aws-sqs
 
-Amazon SQS plugin for [autumn-web](https://crates.io/crates/autumn-web) 0.8.
+Amazon SQS plugin for [autumn-web](https://crates.io/crates/autumn-web) 0.9.
 
 - **Jobs.** Send `#[job]` work to SQS. Workers run the same handler.
 - **Consumers.** Run a handler for each message on a queue: S3 events, SNS fan-out, other services.
@@ -11,7 +11,7 @@ Amazon SQS plugin for [autumn-web](https://crates.io/crates/autumn-web) 0.8.
 
 ```toml
 [dependencies]
-autumn-web = "0.8"
+autumn-web = "0.9"
 autumn-plugin-aws-sqs = "0.1"
 ```
 
