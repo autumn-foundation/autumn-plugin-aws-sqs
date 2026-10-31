@@ -12,7 +12,7 @@ Amazon SQS plugin for [autumn-web](https://crates.io/crates/autumn-web) 0.9.
 ```toml
 [dependencies]
 autumn-web = "0.9"
-autumn-plugin-aws-sqs = "0.1"
+autumn-plugin-aws-sqs = "0.2"
 ```
 
 ## Configure
