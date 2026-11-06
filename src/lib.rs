@@ -28,3 +28,8 @@ pub use jobs::{EnqueueOptions, SqsJobClient};
 pub use metrics::{QueueCounters, SqsMetrics};
 pub use plugin::{AwsSqsPlugin, PLUGIN_NAME, SqsRuntime};
 pub use producer::SqsProducer;
+
+/// Compiles the Rust snippets of the README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

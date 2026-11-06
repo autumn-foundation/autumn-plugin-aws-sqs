@@ -36,6 +36,8 @@ verus verus/policy.rs
 
 ## Rules
 
+- README Rust snippets are doctests. Make them compile; use `no_run`, not `ignore`.
+  `tests/doc_snippets.rs` checks the TOML snippets and the version pins in the docs.
 - Write the test first. See it fail. Then write the code.
 - A change to `src/policy.rs` needs the same change in `verus/policy.rs`. Run Verus.
 - Only `src/transport/` calls SQS. Other code uses `SqsTransport`.
