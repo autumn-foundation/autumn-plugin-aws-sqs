@@ -372,7 +372,7 @@ async fn long_delay_hops_until_due_without_using_attempts() {
     assert!(body["not_before"].as_i64().is_some());
     tokio::time::sleep(Duration::from_secs(1_000)).await;
     assert_eq!(DELAYED_SEEN.load(Ordering::SeqCst), 0);
-    wait_until(Duration::from_secs(2_100), || {
+    wait_until(Duration::from_mins(35), || {
         DELAYED_SEEN.load(Ordering::SeqCst) == 1
     })
     .await;
