@@ -68,22 +68,41 @@ AUTUMN_AWS_SQS__WORKER__MAX_IN_FLIGHT=32
 
 Use your `#[job]` functions as they are.
 
-```rust
+```rust,no_run
+use std::time::Duration;
 use autumn_plugin_aws_sqs::{AwsSqsPlugin, SqsJobClient};
+use autumn_web::prelude::*;
+use autumn_web::reexports::chrono::{DateTime, Utc};
+use autumn_web::{AppState, jobs};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct WelcomeArgs {
+    user_id: u64,
+}
 
 #[job(name = "send_welcome_email", max_attempts = 5, backoff_ms = 1000, queue = "critical")]
-async fn send_welcome_email(state: AppState, args: WelcomeArgs) -> AutumnResult<()> { Ok(()) }
+async fn send_welcome_email(_state: AppState, _args: WelcomeArgs) -> AutumnResult<()> {
+    Ok(())
+}
 
-autumn_web::app()
-    .plugin(AwsSqsPlugin::new().jobs(jobs![send_welcome_email]))
-    .run()
-    .await;
+#[autumn_web::main]
+async fn main() {
+    autumn_web::app()
+        .plugin(AwsSqsPlugin::new().jobs(jobs![send_welcome_email]))
+        .run()
+        .await;
+}
 
 // In a handler:
-let jobs = SqsJobClient::from_state(&state)?;
-jobs.enqueue(SendWelcomeEmailJob::NAME, &args).await?;
-jobs.enqueue_in(SendWelcomeEmailJob::NAME, &args, Duration::from_secs(3600)).await?;
-jobs.enqueue_at(SendWelcomeEmailJob::NAME, &args, when).await?;
+async fn sign_up(state: &AppState, when: DateTime<Utc>) -> AutumnResult<()> {
+    let args = WelcomeArgs { user_id: 7 };
+    let jobs = SqsJobClient::from_state(state)?;
+    jobs.enqueue("send_welcome_email", &args).await?;
+    jobs.enqueue_in("send_welcome_email", &args, Duration::from_secs(3600)).await?;
+    jobs.enqueue_at("send_welcome_email", &args, when).await?;
+    Ok(())
+}
 ```
 
 Do not register these jobs with `AppBuilder::jobs`. If you do not register them, `XJob::enqueue` returns an error. Thus a job cannot go to the local queue by mistake.
@@ -133,15 +152,23 @@ flowchart TD
 ## Consumers
 
 ```rust
-use autumn_plugin_aws_sqs::{ConsumerError, SqsConsumer, SqsMessage};
+use autumn_plugin_aws_sqs::{AwsSqsPlugin, ConsumerError, SqsConsumer, SqsMessage};
+use autumn_web::AppState;
 
-async fn on_upload(state: AppState, msg: SqsMessage) -> Result<(), ConsumerError> {
+#[derive(serde::Deserialize)]
+struct S3Event {
+    #[serde(rename = "Records")]
+    records: Vec<serde_json::Value>,
+}
+
+async fn on_upload(_state: AppState, msg: SqsMessage) -> Result<(), ConsumerError> {
     let event: S3Event = msg.sns_json()?; // or msg.json()?
     // `?` on AutumnError or SqsError retries. Bad JSON rejects.
+    let _ = event.records;
     Ok(())
 }
 
-AwsSqsPlugin::new()
+let plugin = AwsSqsPlugin::new()
     .consumer(SqsConsumer::new("thumbnails", "uploads", on_upload).max_attempts(3));
 ```
 
@@ -152,10 +179,20 @@ AwsSqsPlugin::new()
 ## Producer
 
 ```rust
-let producer = SqsProducer::from_state(&state)?;
-producer.send_json("events", &event).await?;
-producer.send("orders", OutboundMessage::new(body).group_id("tenant-7").dedup_id(id)).await?;
-let results = producer.send_batch("events", messages).await?; // one result per message
+use autumn_plugin_aws_sqs::SqsProducer;
+use autumn_plugin_aws_sqs::transport::OutboundMessage;
+use autumn_web::{AppState, AutumnResult};
+
+async fn publish(state: &AppState, body: String, id: String) -> AutumnResult<()> {
+    let event = serde_json::json!({ "kind": "signup" });
+    let producer = SqsProducer::from_state(state)?;
+    producer.send_json("events", &event).await?;
+    producer.send("orders", OutboundMessage::new(body).group_id("tenant-7").dedup_id(id)).await?;
+    let messages = vec![OutboundMessage::new("a"), OutboundMessage::new("b")];
+    let results = producer.send_batch("events", messages).await?; // one result per message
+    assert_eq!(results.len(), 2);
+    Ok(())
+}
 ```
 
 `send_batch` takes any number of messages. It sends batches of 10 messages or less and 1 MiB or less.
@@ -187,14 +224,23 @@ backend = "redis"   # autumn starts no backend: this app has no autumn jobs
 ## Tests in your app
 
 ```rust
-let sqs = MemoryTransport::new().with_queue(url);
-let rt = AwsSqsPlugin::with_config(config)
-    .with_transport(sqs.clone())
-    .jobs(jobs![my_job])
-    .start(&state)
-    .await?;
-// ... enqueue, then check sqs.messages(url) ...
-rt.shutdown().await;
+use autumn_plugin_aws_sqs::transport::MemoryTransport;
+use autumn_plugin_aws_sqs::{AwsSqsPlugin, SqsConfig, SqsError};
+use autumn_web::AppState;
+use autumn_web::job::JobInfo;
+
+async fn check(state: &AppState, config: SqsConfig, my_job: JobInfo) -> Result<(), SqsError> {
+    let url = "https://sqs.eu-west-1.amazonaws.com/123456789012/jobs";
+    let sqs = MemoryTransport::new().with_queue(url);
+    let rt = AwsSqsPlugin::with_config(config)
+        .with_transport(sqs.clone())
+        .jobs(vec![my_job])
+        .start(state)
+        .await?;
+    // ... enqueue, then check sqs.messages(url) ...
+    rt.shutdown().await;
+    Ok(())
+}
 ```
 
 - `MemoryTransport` follows the SQS rules that this crate uses. These rules are: visibility, receive count, delay, long poll, FIFO groups and dedup, redrive, and the 12 h limit. It also has the size and attribute limits.
