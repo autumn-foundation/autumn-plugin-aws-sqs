@@ -472,11 +472,7 @@ async fn too_long_delay_is_rejected_at_enqueue() {
     let (state, rt) = start_with(t, config(), |p| p.jobs(jobs![h_default])).await;
     let err = SqsJobClient::from_state(&state)
         .unwrap()
-        .enqueue_in(
-            "h_default",
-            &HArgs { n: 1 },
-            Duration::from_secs(400 * 86_400),
-        )
+        .enqueue_in("h_default", &HArgs { n: 1 }, Duration::from_hours(400 * 24))
         .await
         .unwrap_err();
     assert!(matches!(

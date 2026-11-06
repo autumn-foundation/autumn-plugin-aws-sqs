@@ -13,7 +13,7 @@ use autumn_web::plugin::Plugin;
 use autumn_web::plugin_contract::PluginContract;
 use autumn_web::reexports::tokio_util::sync::CancellationToken;
 use autumn_web::time::{ClockSource, SystemClock};
-use autumn_web::{AppState, AutumnError, ProcessRole};
+use autumn_web::{AppState, AutumnError, ProcessRole, Role};
 
 use crate::config::{SECTION, SqsConfig};
 use crate::consumer::SqsConsumer;
@@ -153,7 +153,7 @@ impl AwsSqsPlugin {
     /// # Errors
     /// Returns a config, queue, or transport error.
     pub async fn start(self, state: &AppState) -> Result<SqsRuntime, SqsError> {
-        self.start_with_role(state, state.role()).await
+        self.start_with_role(state, state.role().clone()).await
     }
 
     /// Starts the plugin with no workers, like the `web` role.
@@ -164,17 +164,18 @@ impl AwsSqsPlugin {
         self.start_with_role(state, ProcessRole::Web).await
     }
 
-    /// Starts the plugin as if the process has `role`.
+    /// Starts the plugin as if the process has `role`. A
+    /// [`ProcessRole`] converts into a [`Role`].
     ///
     /// # Errors
     /// Same as [`Self::start`].
     pub async fn start_with_role(
         self,
         state: &AppState,
-        role: ProcessRole,
+        role: impl Into<Role>,
     ) -> Result<SqsRuntime, SqsError> {
         let health = Arc::new(SqsHealth::new(self.readiness_flag()));
-        self.start_inner(state, role, Arc::new(SqsMetrics::new()), health)
+        self.start_inner(state, &role.into(), Arc::new(SqsMetrics::new()), health)
             .await
     }
 
@@ -182,7 +183,7 @@ impl AwsSqsPlugin {
     async fn start_inner(
         self,
         state: &AppState,
-        role: ProcessRole,
+        role: &Role,
         metrics: Arc<SqsMetrics>,
         health: Arc<SqsHealth>,
     ) -> Result<SqsRuntime, SqsError> {
@@ -346,7 +347,7 @@ impl AwsSqsPlugin {
             }
         }
         tracing::info!(
-            role = ?role,
+            role = role.name(),
             workers,
             jobs = shared.routes.len(),
             "aws_sqs started"
@@ -537,7 +538,7 @@ impl Plugin for AwsSqsPlugin {
         Some(
             PluginContract::new(env!("CARGO_PKG_NAME"))
                 .plugin_version(env!("CARGO_PKG_VERSION"))
-                .autumn_web("0.9"),
+                .autumn_web("0.10"),
         )
     }
 
