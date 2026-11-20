@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Amazon SQS plugin for autumn-web 0.10. Style for all docs and comments: ASD-STE100.
+Amazon SQS plugin for autumn-web 0.11. Style for all docs and comments: ASD-STE100.
 
 ## Layout
 
@@ -45,6 +45,6 @@ verus verus/policy.rs
 - A metrics label is an alias or a consumer name. Never a raw URL.
 - No `unwrap` or `expect` in `src/` outside tests.
 - Time in tests: `#[tokio::test(start_paused = true)]` and `tests/common::clock()`.
-- Workers start only when `state.role().runs_workers()` is true.
+- Workers run in the `aws_sqs.workers` background task (capability `aws_sqs.worker`, parent `job_workers`). Do not spawn them from `on_startup`.
 - Delivery is at least once. Do not claim exactly once.
 - Do not log message bodies or credentials.

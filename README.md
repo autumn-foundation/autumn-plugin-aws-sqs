@@ -1,6 +1,6 @@
 # autumn-plugin-aws-sqs
 
-Amazon SQS plugin for [autumn-web](https://crates.io/crates/autumn-web) 0.10.
+Amazon SQS plugin for [autumn-web](https://crates.io/crates/autumn-web) 0.11.
 
 - **Jobs.** Send `#[job]` work to SQS. Workers run the same handler.
 - **Consumers.** Run a handler for each message on a queue: S3 events, SNS fan-out, other services.
@@ -11,8 +11,8 @@ Amazon SQS plugin for [autumn-web](https://crates.io/crates/autumn-web) 0.10.
 
 ```toml
 [dependencies]
-autumn-web = "0.10"
-autumn-plugin-aws-sqs = "0.3"
+autumn-web = "0.11"
+autumn-plugin-aws-sqs = "0.4"
 ```
 
 ## Configure
@@ -72,7 +72,7 @@ Use your `#[job]` functions as they are.
 use std::time::Duration;
 use autumn_plugin_aws_sqs::{AwsSqsPlugin, SqsJobClient};
 use autumn_web::prelude::*;
-use autumn_web::reexports::chrono::{DateTime, Utc};
+use autumn_web::time::Timestamp;
 use autumn_web::{AppState, jobs};
 use serde::{Deserialize, Serialize};
 
@@ -95,7 +95,7 @@ async fn main() {
 }
 
 // In a handler:
-async fn sign_up(state: &AppState, when: DateTime<Utc>) -> AutumnResult<()> {
+async fn sign_up(state: &AppState, when: Timestamp) -> AutumnResult<()> {
     let args = WelcomeArgs { user_id: 7 };
     let jobs = SqsJobClient::from_state(state)?;
     jobs.enqueue("send_welcome_email", &args).await?;
@@ -199,8 +199,19 @@ async fn publish(state: &AppState, body: String, id: String) -> AutumnResult<()>
 
 ## Roles and shutdown
 
-- Workers start only when `state.role().runs_workers()` is true (`combined` or `worker`).
+- The workers run in the background task `aws_sqs.workers`. Its capability is
+  `aws_sqs.worker`, with the parent `job_workers`. So the workers start on the
+  `combined` and `worker` roles, and not on `web`.
 - A `web` replica sends jobs and runs no workers.
+- A named role can turn the workers off and keep the autumn job workers:
+
+  ```toml
+  [roles.cron]
+  base = "worker"
+  capabilities = { "aws_sqs.worker" = false }
+  ```
+
+- `/actuator/tasks` and `autumn graph` show the task and the roles that run it.
 - When the app drains (`/ready` is 503), the workers stop the receive calls. They wait up to `worker.drain_timeout_secs` for handlers that run.
 
 **Split roles need a `[jobs]` backend value.** autumn-web 0.8 stops a `web` or `worker` process at boot when `[jobs] backend` is `local`. It does this even when the app has no autumn jobs. Set a durable backend name. Register no jobs with `AppBuilder::jobs` and no durable event listeners. autumn then starts no job backend.
