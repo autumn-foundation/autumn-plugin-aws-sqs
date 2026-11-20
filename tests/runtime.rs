@@ -514,5 +514,91 @@ fn plugin_declares_autumn_contract() {
         contract.plugin_version.as_deref(),
         Some(env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(contract.autumn_web.as_deref(), Some("0.10"));
+    assert_eq!(contract.autumn_web.as_deref(), Some("0.11"));
+}
+
+// ------------------------------------------------------- background task
+
+/// A config with `role`, `extra` lines and the sensitive actuator endpoints.
+fn role_config(role: &str, extra: &str) -> autumn_web::config::AutumnConfig {
+    toml::from_str(&format!(
+        "role = \"{role}\"\n{extra}\n[actuator]\nsensitive = true\n"
+    ))
+    .expect("config parses")
+}
+
+/// The `/actuator/tasks` entry of the worker task when the app runs as `role`.
+async fn worker_task(
+    t: &MemoryTransport,
+    role: &str,
+    extra: &str,
+) -> (autumn_web::test::TestClient, serde_json::Value) {
+    use autumn_web::test::TestApp;
+    let client = TestApp::new()
+        .config(role_config(role, extra))
+        .plugin(plugin(t).jobs(jobs![noop_job]))
+        .build();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let body: serde_json::Value = client
+        .get("/actuator/tasks")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let task = body["background_tasks"][autumn_plugin_aws_sqs::WORKER_TASK].clone();
+    (client, task)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_role_runs_the_worker_task() {
+    let t = transport();
+    let (client, task) = worker_task(&t, "worker", "").await;
+    assert_eq!(task["status"], "running", "{task}");
+    assert_eq!(task["capability"], "aws_sqs.worker", "{task}");
+    assert_eq!(task["parent"], "job_workers", "{task}");
+    SqsJobClient::from_state(client.state())
+        .unwrap()
+        .enqueue("noop_job", &Upload { key: "k".into() })
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(10), || t.messages(JOBS).is_empty()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_web_role_does_not_place_the_worker_task() {
+    let t = transport();
+    let (client, task) = worker_task(&t, "web", "").await;
+    assert_eq!(task["status"], "not_placed", "{task}");
+    SqsJobClient::from_state(client.state())
+        .unwrap()
+        .enqueue("noop_job", &Upload { key: "k".into() })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(t.messages(JOBS).len(), 1, "no worker drained it");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_named_role_can_turn_the_workers_off() {
+    let t = transport();
+    let roles = "[roles.cron]\nbase = \"worker\"\ncapabilities = { \"aws_sqs.worker\" = false }\n";
+    let (_client, task) = worker_task(&t, "cron", roles).await;
+    assert_eq!(task["status"], "not_placed", "{task}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn start_with_role_follows_the_plugin_capability() {
+    let t = transport();
+    let role: autumn_web::config::AutumnConfig = toml::from_str(
+        "role = \"cron\"\n[roles.cron]\nbase = \"worker\"\ncapabilities = { \"aws_sqs.worker\" = false }\n",
+    )
+    .expect("config parses");
+    let role = role.resolve_role().expect("role resolves");
+    let rt = plugin(&t)
+        .jobs(jobs![noop_job])
+        .start_with_role(&AppState::for_test(), role)
+        .await
+        .unwrap();
+    assert_eq!(rt.workers_running(), 0);
+    rt.shutdown().await;
 }

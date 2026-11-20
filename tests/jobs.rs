@@ -388,8 +388,9 @@ async fn long_delay_hops_until_due_without_using_attempts() {
 async fn enqueue_at_past_runs_now() {
     let t = transport();
     let (state, rt) = start(&t, jobs![ok_job]).await;
-    let past = autumn_web::reexports::chrono::Utc::now()
-        - autumn_web::reexports::chrono::TimeDelta::hours(1);
+    let past = autumn_web::time::Timestamp::now()
+        .checked_sub(autumn_web::time::SignedDuration::from_hours(1))
+        .expect("time fits");
     SqsJobClient::from_state(&state)
         .unwrap()
         .enqueue_at("ok_job", &Args { n: 42 }, past)

@@ -8,12 +8,13 @@ use std::time::Duration;
 
 use autumn_web::actuator::{HealthIndicator, MetricsSource};
 use autumn_web::app::AppBuilder;
+use autumn_web::background::PluginCapability;
 use autumn_web::job::JobInfo;
 use autumn_web::plugin::Plugin;
 use autumn_web::plugin_contract::PluginContract;
 use autumn_web::reexports::tokio_util::sync::CancellationToken;
 use autumn_web::time::{ClockSource, SystemClock};
-use autumn_web::{AppState, AutumnError, ProcessRole, Role};
+use autumn_web::{AppState, AutumnError, Capability, ProcessRole, Role};
 
 use crate::config::{SECTION, SqsConfig};
 use crate::consumer::SqsConsumer;
@@ -27,6 +28,16 @@ use crate::worker::{self, RetryRule, WorkerCtx, WorkerSpec};
 
 /// Plugin name for duplicate detection.
 pub const PLUGIN_NAME: &str = "autumn-plugin-aws-sqs";
+
+/// The capability of the receive workers. A role runs it when it runs job
+/// workers (`combined`, `worker`). A named role can turn it off:
+/// `[roles.<name>] capabilities = { "aws_sqs.worker" = false }`.
+pub const SQS_WORKER: PluginCapability =
+    PluginCapability::new("aws_sqs.worker", Capability::JobWorkers);
+
+/// The name of the background task that runs the receive workers.
+/// `/actuator/tasks` and `autumn graph` show it.
+pub const WORKER_TASK: &str = "aws_sqs.workers";
 
 /// Time limit for each queue check at startup. Startup does not wait longer.
 const STARTUP_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -175,8 +186,15 @@ impl AwsSqsPlugin {
         role: impl Into<Role>,
     ) -> Result<SqsRuntime, SqsError> {
         let health = Arc::new(SqsHealth::new(self.readiness_flag()));
-        self.start_inner(state, &role.into(), Arc::new(SqsMetrics::new()), health)
-            .await
+        let role = role.into();
+        let spawn = role.runs_plugin(SQS_WORKER);
+        let mut rt = self
+            .start_inner(state, &role, Arc::new(SqsMetrics::new()), health)
+            .await?;
+        if spawn && let Some(workers) = rt.pending.take() {
+            workers.spawn_into(&mut rt.handles).await;
+        }
+        Ok(rt)
     }
 
     #[allow(clippy::too_many_lines)] // One linear setup sequence.
@@ -324,28 +342,26 @@ impl AwsSqsPlugin {
                 cancel.clone(),
             )));
         }
-        let workers = if role.runs_workers() { specs.len() } else { 0 };
-        if role.runs_workers() {
-            if dead_letter_url.is_none() {
-                warn_without_dead_letter_path(transport.as_ref(), &specs).await;
-            }
-            let ctx = WorkerCtx {
+        // The workers start later: in the `aws_sqs.workers` background task,
+        // or in `start_with_role`. Each role that runs `aws_sqs.worker`
+        // starts them.
+        let workers = if role.runs_plugin(SQS_WORKER) {
+            specs.len()
+        } else {
+            0
+        };
+        let pending = PendingWorkers {
+            check_dead_letter: dead_letter_url.is_none(),
+            ctx: WorkerCtx {
                 transport,
                 config: config.worker.clone(),
                 metrics: Arc::clone(&metrics),
                 state: state.clone(),
-                cancel: cancel.clone(),
+                cancel: cancel.child_token(),
                 running: Arc::clone(&running),
-            };
-            for spec in specs {
-                // Count before spawn, so `workers_running` is exact after start.
-                running.fetch_add(1, Ordering::SeqCst);
-                let ctx = ctx.clone();
-                handles.push(tokio::spawn(async move {
-                    worker::run(ctx, spec).await;
-                }));
-            }
-        }
+            },
+            specs,
+        };
         tracing::info!(
             role = role.name(),
             workers,
@@ -358,6 +374,7 @@ impl AwsSqsPlugin {
             running,
             metrics,
             health,
+            pending: Some(pending),
         })
     }
 }
@@ -476,6 +493,47 @@ async fn sample_stats(
     }
 }
 
+/// The receive workers of a started plugin, before they run.
+struct PendingWorkers {
+    check_dead_letter: bool,
+    ctx: WorkerCtx,
+    specs: Vec<WorkerSpec>,
+}
+
+impl PendingWorkers {
+    /// Starts one worker loop for each queue. Pushes their handles.
+    async fn spawn_into(self, handles: &mut Vec<tokio::task::JoinHandle<()>>) {
+        if self.check_dead_letter {
+            warn_without_dead_letter_path(self.ctx.transport.as_ref(), &self.specs).await;
+        }
+        for spec in self.specs {
+            // Count before spawn, so `workers_running` is exact after start.
+            self.ctx.running.fetch_add(1, Ordering::SeqCst);
+            let ctx = self.ctx.clone();
+            handles.push(tokio::spawn(async move {
+                worker::run(ctx, spec).await;
+            }));
+        }
+    }
+
+    /// Runs the workers until `shutdown` or the plugin shutdown. Then waits
+    /// for the in-flight handlers.
+    async fn run(self, shutdown: CancellationToken) {
+        let stop = self.ctx.cancel.clone();
+        let mut handles = Vec::new();
+        self.spawn_into(&mut handles).await;
+        tokio::select! {
+            () = shutdown.cancelled() => stop.cancel(),
+            () = stop.cancelled() => {}
+        }
+        for handle in handles {
+            if let Err(e) = handle.await {
+                tracing::warn!(error = %e, "aws_sqs worker ended with an error");
+            }
+        }
+    }
+}
+
 /// A started plugin. Call [`SqsRuntime::shutdown`] to drain.
 pub struct SqsRuntime {
     cancel: CancellationToken,
@@ -483,6 +541,7 @@ pub struct SqsRuntime {
     running: Arc<AtomicUsize>,
     metrics: Arc<SqsMetrics>,
     health: Arc<SqsHealth>,
+    pending: Option<PendingWorkers>,
 }
 
 impl std::fmt::Debug for SqsRuntime {
@@ -538,7 +597,7 @@ impl Plugin for AwsSqsPlugin {
         Some(
             PluginContract::new(env!("CARGO_PKG_NAME"))
                 .plugin_version(env!("CARGO_PKG_VERSION"))
-                .autumn_web("0.10"),
+                .autumn_web("0.11"),
         )
     }
 
@@ -553,6 +612,7 @@ impl Plugin for AwsSqsPlugin {
             Arc::clone(&started),
         );
         let stop = Arc::clone(&started);
+        let workers = Arc::clone(&started);
         app.config_section(SECTION)
             .metrics_source("aws_sqs", metrics as Arc<dyn MetricsSource>)
             .health_indicator("aws_sqs", health as Arc<dyn HealthIndicator>)
@@ -572,6 +632,19 @@ impl Plugin for AwsSqsPlugin {
                         .await
                         .map_err(AutumnError::internal_server_error)?;
                     *s.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rt);
+                    Ok(())
+                }
+            })
+            .background_task(WORKER_TASK, SQS_WORKER, move |_state, shutdown| {
+                let workers = workers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                    .and_then(|rt| rt.pending.take());
+                async move {
+                    if let Some(workers) = workers {
+                        workers.run(shutdown).await;
+                    }
                     Ok(())
                 }
             })

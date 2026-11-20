@@ -298,7 +298,10 @@ async fn enqueue_at_future_waits() {
         .start(&state)
         .await
         .unwrap();
-    let when = clock.now() + autumn_web::reexports::chrono::TimeDelta::seconds(120);
+    let when = clock
+        .now()
+        .checked_add(autumn_web::time::SignedDuration::from_secs(120))
+        .expect("time fits");
     SqsJobClient::from_state(&state)
         .unwrap()
         .enqueue_at("at_job", &AtArgs { n: 1 }, when)

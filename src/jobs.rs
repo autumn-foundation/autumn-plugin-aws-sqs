@@ -9,8 +9,8 @@ use std::time::Duration;
 use autumn_web::AppState;
 use autumn_web::interceptor::JobInterceptor;
 use autumn_web::job::JobInfo;
-use autumn_web::reexports::chrono::{DateTime, Utc};
 use autumn_web::time::ClockSource;
+use autumn_web::time::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
 use tracing::Instrument as _;
@@ -106,12 +106,12 @@ impl std::fmt::Debug for SqsJobClient {
 static DEDUP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A unique ID for FIFO deduplication.
-fn unique_id(now: DateTime<Utc>) -> String {
+fn unique_id(now: Timestamp) -> String {
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u64(DEDUP_COUNTER.fetch_add(1, Ordering::Relaxed));
     format!(
         "{:x}-{:x}-{:016x}",
-        now.timestamp_micros(),
+        now.as_microsecond(),
         DEDUP_COUNTER.load(Ordering::Relaxed),
         h.finish()
     )
@@ -188,10 +188,9 @@ impl SqsJobClient {
         &self,
         job: &str,
         args: &A,
-        when: DateTime<Utc>,
+        when: Timestamp,
     ) -> Result<String, SqsError> {
-        let delay = (when - self.shared.clock.now())
-            .to_std()
+        let delay = Duration::try_from(when.duration_since(self.shared.clock.now()))
             .unwrap_or(Duration::ZERO);
         self.enqueue_in(job, args, delay).await
     }
@@ -241,7 +240,7 @@ impl SqsJobClient {
         }
         let split = split_delay(delay);
         let not_before = (split.later_secs > 0).then(|| {
-            now.timestamp()
+            now.as_second()
                 .saturating_add(i64::try_from(delay).unwrap_or(i64::MAX))
         });
         let seen = self.shared.interceptor.as_ref().map(|_| payload.clone());
@@ -250,7 +249,7 @@ impl SqsJobClient {
             job: job.to_owned(),
             payload,
             not_before,
-            enqueued_at: now.timestamp(),
+            enqueued_at: now.as_second(),
         };
         let message = job_message(&envelope, split.now_secs, fifo, &options, now)?;
         let send = self
@@ -305,7 +304,7 @@ fn job_message(
     delay_secs: u64,
     fifo: bool,
     options: &EnqueueOptions,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<OutboundMessage, SqsError> {
     let mut m = OutboundMessage::new(serde_json::to_string(envelope)?)
         .delay_secs(delay_secs)
@@ -355,10 +354,10 @@ impl Dispatch for JobDispatcher {
             }
             let now = shared.clock.now();
             if let Some(due) = envelope.not_before
-                && due > now.timestamp()
+                && due > now.as_second()
             {
                 let limit = i64::try_from(MAX_JOB_DELAY_SECS).unwrap_or(i64::MAX);
-                if due.saturating_sub(now.timestamp()) > limit {
+                if due.saturating_sub(now.as_second()) > limit {
                     return Outcome::Poison(format!(
                         "not_before is more than {MAX_JOB_DELAY_SECS} s away"
                     ));
@@ -434,9 +433,9 @@ async fn hop(
     route: &JobRoute,
     envelope: &JobEnvelope,
     due: i64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Outcome {
-    let remaining = u64::try_from(due.saturating_sub(now.timestamp())).unwrap_or(0);
+    let remaining = u64::try_from(due.saturating_sub(now.as_second())).unwrap_or(0);
     let split = split_delay(remaining);
     let options = EnqueueOptions::default();
     let message = match job_message(envelope, split.now_secs, false, &options, now) {
@@ -466,7 +465,7 @@ mod tests {
 
     #[test]
     fn unique_ids_differ() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert_ne!(unique_id(now), unique_id(now));
     }
 

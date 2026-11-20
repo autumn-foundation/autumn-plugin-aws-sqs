@@ -26,7 +26,7 @@ pub use error::SqsError;
 pub use health::SqsHealth;
 pub use jobs::{EnqueueOptions, SqsJobClient};
 pub use metrics::{QueueCounters, SqsMetrics};
-pub use plugin::{AwsSqsPlugin, PLUGIN_NAME, SqsRuntime};
+pub use plugin::{AwsSqsPlugin, PLUGIN_NAME, SQS_WORKER, SqsRuntime, WORKER_TASK};
 pub use producer::SqsProducer;
 
 /// Compiles the Rust snippets of the README as doctests.

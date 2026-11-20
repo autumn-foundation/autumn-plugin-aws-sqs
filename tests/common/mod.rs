@@ -41,22 +41,22 @@ pub async fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) {
 
 /// Wall clock that moves with `tokio::time`, so paused tests can skip ahead.
 pub struct TokioClock {
-    base: autumn_web::reexports::chrono::DateTime<autumn_web::reexports::chrono::Utc>,
+    base: autumn_web::time::Timestamp,
     start: tokio::time::Instant,
 }
 
 impl autumn_web::time::ClockSource for TokioClock {
-    fn now(&self) -> autumn_web::reexports::chrono::DateTime<autumn_web::reexports::chrono::Utc> {
-        self.base
-            + autumn_web::reexports::chrono::TimeDelta::from_std(self.start.elapsed())
-                .expect("elapsed fits")
+    fn now(&self) -> autumn_web::time::Timestamp {
+        let elapsed =
+            autumn_web::time::SignedDuration::try_from(self.start.elapsed()).expect("elapsed fits");
+        self.base.checked_add(elapsed).expect("time fits")
     }
 }
 
 /// A [`TokioClock`] that starts now.
 pub fn clock() -> std::sync::Arc<dyn autumn_web::time::ClockSource> {
     std::sync::Arc::new(TokioClock {
-        base: autumn_web::reexports::chrono::Utc::now(),
+        base: autumn_web::time::Timestamp::now(),
         start: tokio::time::Instant::now(),
     })
 }
